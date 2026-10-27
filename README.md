@@ -50,7 +50,7 @@ CUDA needs an NVIDIA GPU, so this doesn't run on a Mac. Use Google Colab (Runtim
 !nvidia-smi
 !git clone https://github.com/arun0786-co/macrograd-cuda.git
 %cd macrograd-cuda
-!nvcc -O3 -arch=native kernels/<file>.cu -o run && ./run
+!nvcc -O3 -arch=native kernels/vector_add.cu -o run && ./run
 ```
 
 ## Results
