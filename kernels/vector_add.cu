@@ -5,19 +5,8 @@
 //
 // build and run: nvcc -O3 -arch=native kernels/vector_add.cu -o run && ./run
 
-#include <cstdio>
-#include <cstdlib>
 #include <cmath>
-#include <cuda_runtime.h>
-
-#define CUDA_CHECK(call)                                                        \
-    do {                                                                        \
-        cudaError_t err = (call);                                               \
-        if (err != cudaSuccess) {                                               \
-            fprintf(stderr, "%s:%d %s\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
-            exit(1);                                                            \
-        }                                                                       \
-    } while (0)
+#include "common.h"
 
 __global__ void vector_add(const float *a, const float *b, float *c, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
