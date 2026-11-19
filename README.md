@@ -10,8 +10,8 @@ macrograd shows how each op and its gradient work. This repo makes those ops fas
 
 Each kernel gets a CPU reference, a correctness test and a timing.
 
-- [ ] vector add
-- [ ] elementwise ops with their backward: relu, tanh, sigmoid, gelu
+- [x] vector add
+- [x] elementwise ops with their backward: relu, tanh, sigmoid, gelu
 - [ ] sum reduction: naive, shared memory, warp shuffle
 - [ ] softmax per row
 - [ ] matmul: naive
@@ -55,7 +55,29 @@ CUDA needs an NVIDIA GPU, so this doesn't run on a Mac. Use Google Colab (Runtim
 
 ## Results
 
-Nothing measured yet. Each table will list the GPU, CUDA version and problem sizes.
+All on an NVIDIA GeForce GTX 1080 Ti with CUDA 12.4, built with `nvcc -O3 -arch=native`. Times are the mean of 100 launches after a warmup.
+
+### Vector add
+
+n = 16,777,223 floats (2^24 + 7, so the last block is only partly used). Each launch reads `a` and `b` and writes `c`, 12 bytes per element.
+
+| | Time | Bandwidth | Max diff vs CPU |
+|---|---|---|---|
+| vector add | 0.555 ms | 362.5 GB/s | 0 |
+
+### Elementwise ops
+
+Same n. Forward reads `x` and writes `y`, 8 bytes per element. Backward adds `dy * f'(x)` into `dx`, reading one of `x` or `y` (tanh and sigmoid get their slope from `y`), `dy` and `dx` and writing `dx`, 16 bytes per element. The error is the largest `|gpu - ref| / (1 + |ref|)` against a CPU version in double precision. Inputs are uniform in [-6, 6] plus 0, tiny values and values up to ±100.
+
+| Op | Forward | Backward | Max error (forward / backward) |
+|---|---|---|---|
+| relu | 0.371 ms, 361.5 GB/s | 0.741 ms, 362.5 GB/s | 0 / 3.0e-8 |
+| tanh | 0.372 ms, 361.2 GB/s | 0.743 ms, 361.2 GB/s | 7.0e-8 / 1.2e-7 |
+| sigmoid | 0.371 ms, 361.4 GB/s | 0.741 ms, 362.4 GB/s | 5.0e-8 / 8.4e-8 |
+| gelu | 0.371 ms, 361.8 GB/s | 0.740 ms, 362.8 GB/s | 8.3e-8 / 5.3e-7 |
+| `cudaMemcpy` device to device | 0.378 ms, 354.8 GB/s | | |
+
+All four run at the same speed as vector add and a plain copy, so they're limited by memory, not by the math: gelu's tanh and cubic cost nothing you can measure. The 1080 Ti is rated at 484 GB/s, and these reach about 75% of that. Making them faster would mean moving fewer bytes, for example by doing the activation in the same kernel as the matmul before it.
 
 ## References
 
