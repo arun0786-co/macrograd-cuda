@@ -10,7 +10,7 @@ macrograd shows how each op and its gradient work. This repo makes those ops fas
 
 Each kernel gets a CPU reference, a correctness test and a timing.
 
-- [ ] vector add
+- [x] vector add
 - [ ] elementwise ops with their backward: relu, tanh, sigmoid, gelu
 - [ ] sum reduction: naive, shared memory, warp shuffle
 - [ ] softmax per row
@@ -55,7 +55,15 @@ CUDA needs an NVIDIA GPU, so this doesn't run on a Mac. Use Google Colab (Runtim
 
 ## Results
 
-Nothing measured yet. Each table will list the GPU, CUDA version and problem sizes.
+All on an NVIDIA GeForce GTX 1080 Ti with CUDA 12.4, built with `nvcc -O3 -arch=native`. Times are the mean of 100 launches after a warmup.
+
+### Vector add
+
+n = 16,777,223 floats (2^24 + 7, so the last block is only partly used). Each launch reads `a` and `b` and writes `c`, 12 bytes per element.
+
+| | Time | Bandwidth | Max diff vs CPU |
+|---|---|---|---|
+| vector add | 0.555 ms | 362.5 GB/s | 0 |
 
 ## References
 
