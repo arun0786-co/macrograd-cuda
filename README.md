@@ -13,7 +13,7 @@ Each kernel gets a CPU reference, a correctness test and a timing.
 - [x] vector add
 - [x] elementwise ops with their backward: relu, tanh, sigmoid, gelu
 - [x] sum reduction: naive, shared memory, warp shuffle
-- [ ] softmax per row
+- [x] softmax per row, with its backward
 - [ ] matmul: naive
 - [ ] matmul: tiled with shared memory
 - [ ] matmul: register blocking
@@ -96,9 +96,30 @@ Same n, uniform in [0, 1), so the sum is about 8.4 million. Each version reads e
 
 The test also checks sizes from 1 to 65,793 (around the block size and the edges of each pass), and runs the shuffle version with 1 and 1024 blocks so every warp of its second pass gets data. I put 9 deliberate bugs into copies of the file and 8 fail the test. The one that passes makes the shared memory version write its partials into the buffer it is reading from. That is a race, but on this GPU the blocks run in order and read their values before a later block overwrites them, so the answer comes out right anyway.
 
+### Softmax per row
+
+The same 2^24 floats as a tall, a square and a wide matrix, softmax over each row. Forward reads `x` and writes `y`, 8 bytes per value; backward adds `y * (dy - sum(dy * y))` into `dx`, reading `y`, `dy` and `dx` and writing `dx`, 16 bytes per value. GB/s counts only those bytes, so a kernel that reads a row more than once gets no credit for it. Inputs are uniform in [-10, 10], with some rows shifted by +1000 or -1000 and some with every third value set to -inf like an attention mask. The forward error is the largest `|gpu - ref| / ref` against a CPU version in double precision; the backward error is relative to the size of the terms that went into each value.
+
+| Kernel | 65536 x 256 | 4096 x 4096 | 256 x 65536 | Max error |
+|---|---|---|---|---|
+| naive: one thread per row, three passes | 20.7 ms, 6.5 GB/s | 3.15 ms, 42.6 GB/s | 49.0 ms, 2.7 GB/s | 5.9e-5 |
+| block: one block of 256 per row, three passes | 0.646 ms, 207.8 GB/s | 0.769 ms, 174.6 GB/s | 0.999 ms, 134.4 GB/s | 1.4e-6 |
+| online: one block per row, max and sum in one pass | 1.174 ms, 114.4 GB/s | 0.580 ms, 231.3 GB/s | 0.789 ms, 170.2 GB/s | 1.4e-6 |
+| backward: one block per row | 0.745 ms, 360.2 GB/s | 1.138 ms, 235.9 GB/s | 1.216 ms, 220.9 GB/s | 1.4e-7 |
+| `cudaMemcpy` device to device | 0.378 ms, 354.8 GB/s | | | |
+
+- The naive version is slow at every shape. With 256 rows it has only 256 threads, one block on one of the 28 SMs. With 65536 rows it has enough threads, but neighbouring threads read floats a whole row apart, so each load of a warp touches 32 places in memory. Its error is the largest because one thread adds a whole row into one running float: 5.9e-5 at 65536 columns, against 2.2e-6 at 256.
+- The online version reads each row twice instead of three times, and takes 25% less time than the block version on the square matrix and 21% less on the wide one. On rows of 256 it is slower: each thread has a single value, so there is no pass to save, and combining two (max, sum) pairs costs two `exp` calls at every shuffle step. Across three runs the block version took 0.65 to 0.72 ms on this shape and the online version 1.11 to 1.17 ms.
+- On the wide matrix, at most 8 blocks of 256 threads fit on an SM, so 224 of the 256 rows run at once and the last 32 run in a second round with most of the GPU idle.
+- The backward at 256 columns runs at copy speed. A row is 1 KB, so its second pass over `y` and `dy` comes from cache. On longer rows it drops to about 230 GB/s.
+- No forward version reaches copy speed. The next step would be to keep the row in registers or shared memory, so `x` is read from memory once.
+
+The test also checks the backward formula against finite differences, and 30 small shapes: 1 to 4097 columns (around a warp and a block) and 1 to 257 rows (around the naive version's block). I put 14 deliberate bugs into copies of the file and 13 fail the test. The one that passes removes the `__syncthreads` before a block reduction writes its per-warp results, so a warp can overwrite a value another warp is still reading from the previous reduction. That is a race, but it didn't show up in these runs on this GPU.
+
 ## References
 
 - [How to Optimize a CUDA Matmul Kernel for cuBLAS-like Performance](https://siboehm.com/articles/22/CUDA-MMM), Simon Boehm
 - [Optimizing Parallel Reduction in CUDA](https://developer.download.nvidia.com/assets/cuda/files/reduction.pdf), NVIDIA
+- [Online normalizer calculation for softmax](https://arxiv.org/abs/1805.02867), Milakov and Gimelshein
 - [llm.c](https://github.com/karpathy/llm.c), GPT-2 training in plain C and CUDA
 - [CUDA C++ Programming Guide](https://docs.nvidia.com/cuda/cuda-c-programming-guide/)
