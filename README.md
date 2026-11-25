@@ -14,7 +14,7 @@ Each kernel gets a CPU reference, a correctness test and a timing.
 - [x] elementwise ops with their backward: relu, tanh, sigmoid, gelu
 - [x] sum reduction: naive, shared memory, warp shuffle
 - [x] softmax per row, with its backward
-- [ ] matmul: naive
+- [x] matmul: naive
 - [ ] matmul: tiled with shared memory
 - [ ] matmul: register blocking
 
@@ -115,6 +115,24 @@ The same 2^24 floats as a tall, a square and a wide matrix, softmax over each ro
 - No forward version reaches copy speed. The next step would be to keep the row in registers or shared memory, so `x` is read from memory once.
 
 The test also checks the backward formula against finite differences, and 30 small shapes: 1 to 4097 columns (around a warp and a block) and 1 to 257 rows (around the naive version's block). I put 14 deliberate bugs into copies of the file and 13 fail the test. The one that passes removes the `__syncthreads` before a block reduction writes its per-warp results, so a warp can overwrite a value another warp is still reading from the previous reduction. That is a race, but it didn't show up in these runs on this GPU.
+
+### Matmul: naive
+
+`C = A @ B` for square matrices, one thread per value of `C`, blocks of 32 x 32 threads. GFLOPS counts a multiply and an add for each of the `n^3` terms. Inputs are uniform in [-1, 1]. The error is `|gpu - ref| / sum_k |A[i][k] B[k][j]|` against a CPU matmul in double precision, over every value up to 1024 x 1024 and over 4100 sampled values above that. The last column is the time of `cublasSgemm` divided by the kernel's time.
+
+| Kernel | 256 | 512 | 1024 | 2048 | 4096 | 4096, of cuBLAS |
+|---|---|---|---|---|---|---|
+| rows: `threadIdx.x` picks the row of `C` | 48.8 GFLOPS | 59.8 | 66.4 | 75.0 | 52.5 (2617 ms) | 0.5% |
+| cols: `threadIdx.x` picks the column of `C` | 277.9 | 346.0 | 370.8 | 487.8 | 468.9 (293 ms) | 4.8% |
+| `cublasSgemm` | 3245 | 4428 | 9044 | 10129 | 9849 (13.95 ms) | 100% |
+
+The largest error was 2.9e-7, for cuBLAS too.
+
+- The two kernels do the same arithmetic in the same order. The only difference is which thread gets which value of `C`. With `threadIdx.x` on the row, the 32 threads of a warp read `A` from 32 rows `n` floats apart at every step of `k`, and write `C` the same way. With it on the column, they read 32 neighbouring floats of `B`, which come in one transaction, and all want the same float of `A`, which the hardware sends to all of them at once. That alone makes it 6 to 9 times faster.
+- Even so, it gets less than 5% of cuBLAS. Every multiply-add needs two loads, and nothing a thread loads is reused by the threads next to it except through the cache. The tiled version loads a tile of `A` and of `B` into shared memory once and has the whole block use it.
+- cuBLAS reaches 10.1 TFLOPS at 2048, about 90% of the 11.3 TFLOPS the 1080 Ti is rated for at its boost clock. At 256 it gets a third of that, because there isn't enough work to keep all 28 SMs busy.
+
+The test also checks 10 small and odd shapes, from 1 x 1 x 1 to 1000 x 777 x 513, including shapes where the last block is only partly used, single rows and columns, and `K = 1`. `C` is filled with NaN first, so a value that never gets written fails the test. I put 15 deliberate bugs into copies of the file (wrong strides, skipped rows, columns or steps of `k`, swapped grid dimensions) and all 15 fail the test.
 
 ## References
 
