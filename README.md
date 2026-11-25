@@ -12,7 +12,7 @@ Each kernel gets a CPU reference, a correctness test and a timing.
 
 - [x] vector add
 - [x] elementwise ops with their backward: relu, tanh, sigmoid, gelu
-- [ ] sum reduction: naive, shared memory, warp shuffle
+- [x] sum reduction: naive, shared memory, warp shuffle
 - [ ] softmax per row
 - [ ] matmul: naive
 - [ ] matmul: tiled with shared memory
@@ -78,6 +78,23 @@ Same n. Forward reads `x` and writes `y`, 8 bytes per element. Backward adds `dy
 | `cudaMemcpy` device to device | 0.378 ms, 354.8 GB/s | | |
 
 All four run at the same speed as vector add and a plain copy, so they're limited by memory, not by the math: gelu's tanh and cubic cost nothing you can measure. The 1080 Ti is rated at 484 GB/s, and these reach about 75% of that. Making them faster would mean moving fewer bytes, for example by doing the activation in the same kernel as the matmul before it.
+
+### Sum reduction
+
+Same n, uniform in [0, 1), so the sum is about 8.4 million. Each version reads every float once, 4 bytes per element. The error is `|gpu - ref| / sum(|x|)` against a CPU sum in double precision. "Same bits" means 6 runs gave exactly the same float.
+
+| Kernel | Time | Bandwidth | Error | Same bits |
+|---|---|---|---|---|
+| atomic: every thread does `atomicAdd` into one float | 27.4 ms | 2.4 GB/s | 1.3e-4 | no |
+| shared memory: a tree per block of 256, run again on the partials (4 launches) | 0.520 ms | 129.1 GB/s | 3.2e-9 | yes |
+| warp shuffle: grid-stride loop, `__shfl_down_sync` in each warp, 224 blocks then 1 | 0.191 ms | 351.0 GB/s | 3.2e-9 | yes |
+| `cub::DeviceReduce::Sum` | 0.186 ms | 361.2 GB/s | 3.2e-9 | yes |
+
+- The atomic version is about 140 times slower than the others because 16.7 million adds to one address happen one at a time. It is also the least accurate: once the total is in the millions, a float can only change in steps of 0.5 or 1, so each small value added loses its low bits. The order of the adds changes from run to run, and so does the answer.
+- The shared memory version adds in a fixed tree, so it is accurate and gives the same answer every time. It reads only 256 floats per block before a long chain of `__syncthreads` steps, and it needs four launches, so it reaches about a third of the memory bandwidth.
+- The warp shuffle version has each thread add about 290 floats in a register first, then the warp adds its 32 sums by passing registers, with no shared memory until the last 8 values. It runs at 97% of CUB's speed and at the same speed as a plain copy, so it is limited by memory.
+
+The test also checks sizes from 1 to 65,793 (around the block size and the edges of each pass), and runs the shuffle version with 1 and 1024 blocks so every warp of its second pass gets data. I put 9 deliberate bugs into copies of the file and 8 fail the test. The one that passes makes the shared memory version write its partials into the buffer it is reading from. That is a race, but on this GPU the blocks run in order and read their values before a later block overwrites them, so the answer comes out right anyway.
 
 ## References
 
