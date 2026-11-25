@@ -15,7 +15,7 @@ Each kernel gets a CPU reference, a correctness test and a timing.
 - [x] sum reduction: naive, shared memory, warp shuffle
 - [x] softmax per row, with its backward
 - [x] matmul: naive
-- [ ] matmul: tiled with shared memory
+- [x] matmul: tiled with shared memory
 - [ ] matmul: register blocking
 
 ### 2. Train an MLP on MNIST
@@ -133,6 +133,25 @@ The largest error was 2.9e-7, for cuBLAS too.
 - cuBLAS reaches 10.1 TFLOPS at 2048, about 90% of the 11.3 TFLOPS the 1080 Ti is rated for at its boost clock. At 256 it gets a third of that, because there isn't enough work to keep all 28 SMs busy.
 
 The test also checks 10 small and odd shapes, from 1 x 1 x 1 to 1000 x 777 x 513, including shapes where the last block is only partly used, single rows and columns, and `K = 1`. `C` is filled with NaN first, so a value that never gets written fails the test. I put 15 deliberate bugs into copies of the file (wrong strides, skipped rows, columns or steps of `k`, swapped grid dimensions) and all 15 fail the test.
+
+### Matmul: tiled with shared memory
+
+Same setup as the naive matmul. Each block of T x T threads walks along `K` one tile at a time: every thread loads one float of a T x T tile of `A` and one of `B` into shared memory, the block waits at `__syncthreads`, then every thread does T multiply-adds from shared memory. Each float loaded from global memory is used T times instead of once.
+
+| Kernel | 256 | 512 | 1024 | 2048 | 4096 | 4096, of cuBLAS |
+|---|---|---|---|---|---|---|
+| naive, columns across the warp | 279.3 GFLOPS | 348.5 | 409.8 | 476.2 | 457.6 (300 ms) | 4.8% |
+| tiled, T = 16 | 939.1 | 1271.7 | 1270.2 | 1395.1 | 1404.8 (97.8 ms) | 14.7% |
+| tiled, T = 32 | 904.2 | 1219.3 | 1310.2 | 1598.9 | 1627.9 (84.4 ms) | 17.0% |
+| `cublasSgemm` | 3310 | 4490 | 7652 | 9162 | 9586 (14.3 ms) | 100% |
+
+The largest error was 2.9e-7, the same as the naive version, since the adds happen in the same order.
+
+- Tiling with T = 32 makes it 3.6 times faster than the naive version at 4096.
+- T = 16 is a little faster up to 512. A 256 x 256 matrix has only 64 tiles of 32 x 32 for the 28 SMs, against 256 tiles of 16 x 16. From 1024 up there is work for every SM either way, and T = 32 wins because each float it loads is used 32 times instead of 16.
+- It is still at 17% of cuBLAS. Each multiply-add now reads two floats from shared memory instead of global memory, so shared memory is probably the next limit. The register blocking version has each thread compute several values of `C`, so one float read from shared memory feeds several multiply-adds.
+
+I put 10 deliberate bugs into copies of the file and all 10 fail the test. Two of them only did so after I changed the test. Each removes one bounds check along `K`. That alone gives the right answer, because the other tile still has a 0 there and the product is 0, but it reads past the end of `A` or `B`. The memory there held leftover numbers, and a leftover number times 0 is 0. Now the test fills the buffers with NaN before copying `A` and `B` in, so a read past the end gives NaN times 0, which is NaN, and fails.
 
 ## References
 
