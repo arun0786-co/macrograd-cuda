@@ -128,7 +128,7 @@ The test also checks the backward formula against finite differences, and 30 sma
 
 The largest error was 2.9e-7, for cuBLAS too.
 
-- The two kernels do the same arithmetic in the same order. The only difference is which thread gets which value of `C`. With `threadIdx.x` on the row, the 32 threads of a warp read `A` from 32 rows `n` floats apart at every step of `k`, and write `C` the same way. With it on the column, they read 32 neighbouring floats of `B`, which come in one transaction, and all want the same float of `A`, which the hardware sends to all of them at once. That alone makes it 6 to 9 times faster.
+- The two kernels do the same arithmetic in the same order. The only difference is which thread gets which value of `C`. With `threadIdx.x` on the row, the 32 threads of a warp read `A` from 32 rows `n` floats apart at every step of `k`, and write `C` the same way. With it on the column, they read 32 neighbouring floats of `B`, which come in one transaction, and all want the same float of `A`, which the hardware sends to all of them at once. That alone makes it 5.6 to 8.9 times faster.
 - Even so, it gets less than 5% of cuBLAS. Every multiply-add needs two loads, and nothing a thread loads is reused by the threads next to it except through the cache. The tiled version loads a tile of `A` and of `B` into shared memory once and has the whole block use it.
 - cuBLAS reaches 10.1 TFLOPS at 2048, about 90% of the 11.3 TFLOPS the 1080 Ti is rated for at its boost clock. At 256 it gets a third of that, because there isn't enough work to keep all 28 SMs busy.
 
