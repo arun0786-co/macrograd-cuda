@@ -22,7 +22,7 @@ Each kernel gets a CPU reference, a correctness test and a timing.
 
 Forward and backward written by hand for each layer, no autograd.
 
-- [ ] linear layer forward and backward
+- [x] linear layer forward and backward
 - [ ] cross entropy forward and backward
 - [ ] SGD and Adam update kernels
 - [ ] full training loop on the GPU, matching macrograd's loss on a small model with the same weights
@@ -172,6 +172,31 @@ The largest error was 2.9e-7 over the square sizes. The three runs agree within 
 - It is still at 37% of cuBLAS.
 
 The test also checks that nothing is written up to 128 rows past the end of `C`. I added that after a bug that removed the 2d kernel's row check passed. I put 17 deliberate bugs into copies of the file and 14 fail the test. Two of the three that pass remove a bounds check on the rows of `A` or the columns of `B`. Those values only go into values of `C` outside the matrix, which are never written, though the kernel does read past the end of `A` or into the next row of `B`. The third removes the last `__syncthreads` of the 2d loop, so a thread can load the next tile while another still reads this one. That is a race, but it didn't show up in these runs on this GPU.
+
+### Linear layer
+
+`kernels/linear.cu` does `y = x @ W + b` and its backward, `dx += dy @ W^T`, `dW += x^T @ dy` and `db +=` the column sums of `dy`. All three matmuls use the 2d blocked kernel. It now takes flags for an `A` or `B` stored transposed, so `W^T` and `x^T` are read in place, and at the end it can add a bias or add into what `C` already holds. `db` is a column sum with 32 x 8 threads per 32 columns. The same layer is also built from `cublasSgemm`, for comparison.
+
+It is checked three ways:
+
+- `tests/make_linear_fixture.py` runs one forward and backward through macrograd's `linear` and saves the numbers. The GPU results are within 2.0e-7 of macrograd's, for both versions.
+- Eleven shapes against a CPU version in double, every value checked: one row, one input or one output, shapes that don't fill a 128 block or a step of 8 along the inner dimension, and the MNIST shapes. The gradients start at random values, so the test sees that they are added to.
+- Nothing is written in the 1024 floats after the end of any output.
+
+| Rows x in -> out | Blocked forward | Blocked backward | cuBLAS forward | cuBLAS backward |
+|---|---|---|---|---|
+| 64 x 784 -> 128 | 0.255 ms (50 GFLOPS) | 0.095 ms (270) | 0.014 ms (925) | 0.014 ms (1864) |
+| 1024 x 784 -> 128 | 0.392 ms (525) | 0.601 ms (684) | 0.042 ms (4914) | 0.087 ms (4715) |
+| 1024 x 1024 -> 1024 | 1.21 ms (1771) | 2.34 ms (1832) | 0.250 ms (8582) | 0.486 ms (8833) |
+| 4096 x 4096 -> 4096 | 37.6 ms (3656) | 76.7 ms (3582) | 12.7 ms (10846) | 25.0 ms (10997) |
+
+The backward does two matmuls of the same size as the forward, so it counts twice the flops. A first run was 10% to 28% slower at the three smaller sizes for both versions, cuBLAS included; the table is from the second run.
+
+- At 4096 the blocked layer gets the same speed as the plain blocked matmul, 3.6 TFLOPS forward and backward, about a third of cuBLAS. Reading `W` and `x` transposed in place costs nothing measurable.
+- At MNIST sizes it is 18 times slower than cuBLAS going forward. A batch of 64 with 128 outputs is a single 128 x 128 block, so one of the 28 SMs does all of it and walks through the 784 inputs alone. The backward is faster than the forward here because its two matmuls have 7 blocks each. cuBLAS picks smaller tiles or splits the inner dimension for shapes like these. The training loop will need one of those.
+- The loads of a transposed `A` are arranged so neighbouring threads read neighbouring floats. Loading it the same way as a plain `A` gave the same times (76.8 ms against 76.7 at 4096), so that arrangement doesn't matter here.
+
+I put 15 deliberate bugs into copies of the file and 12 fail the test. The three that pass are the same kinds that passed for the blocked matmul: one removes the column check when loading `B`, which only changes values of `C` that are never written; one removes the `__syncthreads` at the end of the main loop, a race that didn't show on this GPU; and one is the load arrangement above, which only changes speed.
 
 ## References
 
