@@ -16,7 +16,7 @@ Each kernel gets a CPU reference, a correctness test and a timing.
 - [x] softmax per row, with its backward
 - [x] matmul: naive
 - [x] matmul: tiled with shared memory
-- [ ] matmul: register blocking
+- [x] matmul: register blocking
 
 ### 2. Train an MLP on MNIST
 
@@ -55,7 +55,7 @@ CUDA needs an NVIDIA GPU, so this doesn't run on a Mac. Use Google Colab (Runtim
 
 ## Results
 
-All on an NVIDIA GeForce GTX 1080 Ti with CUDA 12.4, built with `nvcc -O3 -arch=native`. Times are the mean of 100 launches after a warmup.
+All on an NVIDIA GeForce GTX 1080 Ti with CUDA 12.4 (12.9 for register blocking), built with `nvcc -O3 -arch=native`. Times are the mean of 100 launches after a warmup.
 
 ### Vector add
 
@@ -152,6 +152,26 @@ The largest error was 2.9e-7, the same as the naive version, since the adds happ
 - It is still at 17% of cuBLAS. Each multiply-add now reads two floats from shared memory instead of global memory, so shared memory is probably the next limit. The register blocking version has each thread compute several values of `C`, so one float read from shared memory feeds several multiply-adds.
 
 I put 10 deliberate bugs into copies of the file and all 10 fail the test. Two of them only did so after I changed the test. Each removes one bounds check along `K`. That alone gives the right answer, because the other tile still has a 0 there and the product is 0, but it reads past the end of `A` or `B`. The memory there held leftover numbers, and a leftover number times 0 is 0. Now the test fills the buffers with NaN before copying `A` and `B` in, so a read past the end gives NaN times 0, which is NaN, and fails.
+
+### Matmul: register blocking
+
+Same setup as the other matmuls, with CUDA 12.9. Each thread makes several values of `C` and keeps them in registers, so a float read from shared memory feeds several multiply-adds. Both versions walk along `K` 8 columns at a time. These are from one of three runs.
+
+| Kernel | 256 | 512 | 1024 | 2048 | 4096 | 4096, of cuBLAS |
+|---|---|---|---|---|---|---|
+| tiled, T = 32 | 904.2 GFLOPS | 1221.1 | 1308.8 | 1660.5 | 1641.5 (83.7 ms) | 16.8% |
+| 1d: 8 values down a column per thread, blocks of 64 x 64 | 781.8 | 1246.3 | 1819.3 | 2426.6 | 2569.7 (53.5 ms) | 26.3% |
+| 2d: 8 x 8 values per thread, blocks of 128 x 128 | 267.3 | 952.4 | 1498.6 | 2913.4 | 3637.3 (37.8 ms) | 37.3% |
+| `cublasSgemm` | 3330 | 4512 | 7697 | 9218 | 9763 (14.1 ms) | 100% |
+
+The largest error was 2.9e-7 over the square sizes. The three runs agree within 4% at 4096, but the third was up to 27% faster than the second at 256 to 1024 for every kernel, cuBLAS included, so compare kernels within a run.
+
+- At 4096 the 1d version is 1.6 times faster than the tiled one and the 2d version 2.2 times. The tiled version reads two floats from shared memory per multiply-add, the 1d version 9 for 8 and the 2d version 16 for 64.
+- The 2d version is the slowest of the three up to 512. Its blocks are large: a 256 x 256 `C` has only 4 of them and a 512 x 512 one has 16, so most or many of the 28 SMs have nothing to do. It passes the 1d version at 2048.
+- The 1d kernel needs `__launch_bounds__`. Left alone it uses 68 registers per thread, so only one block of 512 threads fits on an SM, and it gets 1447 GFLOPS at 4096. Capped at 64 registers, with no spills, two blocks fit.
+- It is still at 37% of cuBLAS.
+
+The test also checks that nothing is written up to 128 rows past the end of `C`. I added that after a bug that removed the 2d kernel's row check passed. I put 17 deliberate bugs into copies of the file and 14 fail the test. Two of the three that pass remove a bounds check on the rows of `A` or the columns of `B`. Those values only go into values of `C` outside the matrix, which are never written, though the kernel does read past the end of `A` or into the next row of `B`. The third removes the last `__syncthreads` of the 2d loop, so a thread can load the next tile while another still reads this one. That is a race, but it didn't show up in these runs on this GPU.
 
 ## References
 
