@@ -157,6 +157,31 @@ GB/s counts each value once: 8 bytes for the forward (read `x`, write `y`), 16 f
 
 I put 15 deliberate bugs into copies of the file and 14 fail the test. The one that passes uses a warp per row for every width, which is still right, just slower. One more passed at first: without the check for rows past the end, the forward wrote past the end of `y`, which the test didn't look at. It does now.
 
+### Prefix sum (cumsum)
+
+`kernels/cumsum.cu` is macrograd's `cumsum` along the last axis, `out[k] = x[0] + ... + x[k]` on each row, and its backward, the same scan run from the end of the row and added into `dx`. Each thread scans 4 values of its own, the threads' totals are scanned across the block (5 `__shfl_up_sync` steps in each warp, then the same on the warps' totals), and each thread adds the total of everything before it. Two ways to lay it out:
+
+1. Rows: one block per row walks the row 1024 values at a time and carries the total along.
+2. Tiles, for a few long rows: one kernel sums each tile of 1024, a second scans the tiles' sums, and a third scans each tile again starting from the sum of the tiles before it. It reads `x` twice, but every SM has work.
+
+`cumsum()` picks rows from 2 rows per SM up, and tiles below that. The test runs every version forward and backward on 13 shapes, from 1 x 1 to 1 x 3000001 and 7 x 100000. With whole numbers from -3 to 3 every partial sum is exact in float, and the GPU matches the CPU bit for bit. With random floats the largest error is 1.2e-7, relative to the sum of `|x|` so far.
+
+| Rows x cols | Rows | Tiles | Backward (auto) |
+|---|---|---|---|
+| 1 x 16777216 | 22.6 ms, 5.9 GB/s | 0.698 ms, 192.2 GB/s | 0.815 ms, 246.9 GB/s |
+| 16 x 1048576 | 1.301 ms, 103.1 | 0.643 ms, 208.8 | 0.793 ms, 253.8 |
+| 64 x 262144 | 0.505 ms, 265.7 | 0.644 ms, 208.4 | 0.733 ms, 274.8 |
+| 4096 x 4096 | 0.419 ms, 320.3 | 0.680 ms, 197.4 | 0.580 ms, 346.8 |
+| 65536 x 256 | 0.496 ms, 270.5 | 1.223 ms, 109.7 | 0.725 ms, 277.6 |
+
+GB/s counts 8 bytes a value for the forward and 12 for the backward, which also reads `dx`. `cub::DeviceScan::InclusiveSum` does one row of 16777216 in 0.380 ms, 353.1 GB/s, and `cudaMemcpy` does 356.0 GB/s.
+
+- One block per row on a single row of 16M puts the whole job on one SM: 22.6 ms. The tiles version spreads it over all of them and is 32 times faster.
+- cub is still 1.8 times faster than the tiles on one long row: it reads `x` once. Each block waits for the block before it to publish its total, and looks back over several earlier blocks so the wait is short ("decoupled look-back", Merrill and Garland, 2016).
+- With many rows, a block per row runs at 270 to 320 GB/s and the tiles version only adds work.
+
+I put 13 deliberate bugs into copies of the file and 12 fail the test. The one that passes removes the `__syncthreads` before the block scan writes its per-warp totals, so a warp can overwrite a total another warp is still reading from the previous call. That is a race, and it didn't show up on this GPU.
+
 ### Matmul: naive
 
 `C = A @ B` for square matrices, one thread per value of `C`, blocks of 32 x 32 threads. GFLOPS counts a multiply and an add for each of the `n^3` terms. Inputs are uniform in [-1, 1]. The error is `|gpu - ref| / sum_k |A[i][k] B[k][j]|` against a CPU matmul in double precision, over every value up to 1024 x 1024 and over 4100 sampled values above that. The last column is the time of `cublasSgemm` divided by the kernel's time.
