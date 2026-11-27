@@ -23,7 +23,7 @@ Each kernel gets a CPU reference, a correctness test and a timing.
 Forward and backward written by hand for each layer, no autograd.
 
 - [x] linear layer forward and backward
-- [ ] cross entropy forward and backward
+- [x] cross entropy forward and backward
 - [ ] SGD and Adam update kernels
 - [ ] full training loop on the GPU, matching macrograd's loss on a small model with the same weights
 
@@ -197,6 +197,31 @@ The backward does two matmuls of the same size as the forward, so it counts twic
 - The loads of a transposed `A` are arranged so neighbouring threads read neighbouring floats. Loading it the same way as a plain `A` gave the same times (76.8 ms against 76.7 at 4096), so that arrangement doesn't matter here.
 
 I put 15 deliberate bugs into copies of the file and 12 fail the test. The three that pass are the same kinds that passed for the blocked matmul: one removes the column check when loading `B`, which only changes values of `C` that are never written; one removes the `__syncthreads` at the end of the main loop, a race that didn't show on this GPU; and one is the load arrangement above, which only changes speed.
+
+### Cross entropy
+
+`kernels/cross_entropy.cu` is softmax plus negative log likelihood with integer labels, the mean over rows, and its backward `dloss / R * (softmax(x) - one_hot(label))`, added into `dx`. The forward goes over each row once: the online max and sum from the softmax, then `log(d) + (m - x[label])`, where `m - x` stays exact even for logits near 1000. It saves `m` and `1 / d` for each row, so the backward makes the softmax without another pass. A second small kernel takes the mean in a fixed order, so the loss is the same on every run. A label outside the row gives a NaN loss.
+
+Rows are given to threads three ways: a thread per row, a warp per row, or a block of 256 per row. Same 2^24 logits as different shapes. Forward GB/s counts 4 bytes per logit and backward 12 (read `x` and `dx`, write `dx`):
+
+| Rows x classes | Thread per row | Warp per row | Block per row | Backward |
+|---|---|---|---|---|
+| 1677721 x 10 | 1.644 ms, 40.8 GB/s | 3.427 ms, 19.6 | 21.09 ms, 3.2 | 0.622 ms, 323.9 |
+| 524288 x 32 | 1.215 ms, 55.2 | 0.937 ms, 71.6 | 6.548 ms, 10.2 | 0.578 ms, 348.4 |
+| 262144 x 64 | 1.613 ms, 41.6 | 0.523 ms, 128.3 | 3.416 ms, 19.6 | 0.570 ms, 353.5 |
+| 65536 x 256 | 3.566 ms, 18.8 | 0.237 ms, 283.0 | 1.176 ms, 57.1 | 0.573 ms, 351.4 |
+| 16384 x 1024 | 1.442 ms, 46.5 | 0.202 ms, 331.6 | 0.364 ms, 184.2 | 0.599 ms, 336.2 |
+| 4096 x 4096 | 1.411 ms, 47.5 | 0.227 ms, 296.1 | 0.223 ms, 300.6 | 0.585 ms, 344.4 |
+| 333 x 50257 | 16.64 ms, 4.0 | 0.534 ms, 125.3 | 0.266 ms, 251.8 | 0.567 ms, 354.4 |
+
+`cudaMemcpy` device to device does 355.8 GB/s. `cross_entropy()` uses a thread per row up to 16 classes, a warp per row up to 1024, and a block per row above that.
+
+- A warp per row is the best from 32 to 1024 classes and close to copy speed at 1024. At 10 classes it's the slowest of the useful versions: 22 of the 32 lanes have nothing, and combining two (max, sum) pairs at each of the 5 shuffle steps costs two `exp` calls, which is more work than the row itself. A thread per row is twice as fast there.
+- At 50257 classes there are only 333 rows, so a warp per row runs 333 warps, about 12 per SM. A block per row has 8 times as many threads on the job and is twice as fast.
+- The 10-class forward is still far from copy speed. The mean is part of it: one block adds 1.68M row losses, which took 0.43 ms of the 1.64 alone. At an MNIST batch of 64 rows the forward kernel takes 2.8 µs and the mean 3.7 µs, so both are about the cost of a launch.
+- The backward runs at 324 to 354 GB/s at every shape, since it is one thread per logit.
+
+The test checks the backward formula against finite differences of the CPU loss (4.9e-11), and 66 shapes against a CPU version in double, with every version: 1 to 2500 rows and 1 to 5000 classes, around a warp, a block and the 1024 switch. Rows are uniform in [-10, 10], some shifted by +1000 or -1000 and some with every fourth logit at -inf, and the labels include the first and last column. The largest error was 3.6e-7 for the loss, relative to `1 + |m|`, and 5.0e-8 for `dx`. I put 18 deliberate bugs into copies of the file and 17 fail the test. The one that passes removes the `__syncthreads` between the steps of the mean's tree sum, a race that didn't show on this GPU.
 
 ## References
 
