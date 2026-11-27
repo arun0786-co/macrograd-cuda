@@ -116,6 +116,24 @@ The same 2^24 floats as a tall, a square and a wide matrix, softmax over each ro
 
 The test also checks the backward formula against finite differences, and 30 small shapes: 1 to 4097 columns (around a warp and a block) and 1 to 257 rows (around the naive version's block). I put 14 deliberate bugs into copies of the file and 13 fail the test. The one that passes removes the `__syncthreads` before a block reduction writes its per-warp results, so a warp can overwrite a value another warp is still reading from the previous reduction. That is a race, but it didn't show up in these runs on this GPU.
 
+### Transpose
+
+`kernels/transpose.cu` turns `in (R, C)` into `out (C, R)` three ways, all on 32 x 32 tiles with blocks of 32 x 8 threads that move 4 values each. Naive reads along rows of `in` and writes down columns of `out`. Tiled goes through shared memory, so both the reads and the writes run along rows. Padded is tiled with the tile 33 floats wide, so reading down a column of it touches 32 different banks instead of one. Every value is checked exactly on 12 shapes, from 1 x 1 to 4097 x 3, with nothing written past the end. GB/s counts 8 bytes per value.
+
+| Rows x cols | Naive | Tiled | Padded |
+|---|---|---|---|
+| 4096 x 4096 | 1.109 ms, 121.1 GB/s | 0.411 ms, 326.8 | 0.388 ms, 346.1 |
+| 16384 x 1024 | 1.002 ms, 133.9 | 0.399 ms, 336.3 | 0.392 ms, 342.8 |
+| 1024 x 16384 | 0.882 ms, 152.2 | 0.419 ms, 320.2 | 0.425 ms, 315.7 |
+| 4000 x 4000 | 0.895 ms, 143.0 | 0.416 ms, 307.7 | 0.410 ms, 312.0 |
+
+`cudaMemcpy` does 356.1 GB/s.
+
+- Going through shared memory makes it 2.1 to 2.7 times faster, and the padded version reaches 97% of copy speed at 4096 x 4096.
+- The padding itself does little: 6% at 4096 x 4096, 1 to 2% at the others, and 1% slower at 1024 x 16384. A warp's column read has 32-way bank conflicts without it, but the kernel waits on DRAM, so shared memory has time to spare.
+
+I put 7 deliberate bugs into copies of the file and 6 fail the test. The one that passes removes the column check when loading the tile, which only fills tile slots that go to rows of `out` past the end, which are never written.
+
 ### Matmul: naive
 
 `C = A @ B` for square matrices, one thread per value of `C`, blocks of 32 x 32 threads. GFLOPS counts a multiply and an add for each of the `n^3` terms. Inputs are uniform in [-1, 1]. The error is `|gpu - ref| / sum_k |A[i][k] B[k][j]|` against a CPU matmul in double precision, over every value up to 1024 x 1024 and over 4100 sampled values above that. The last column is the time of `cublasSgemm` divided by the kernel's time.
