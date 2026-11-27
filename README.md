@@ -254,7 +254,7 @@ The full run trains 10 epochs from macrograd's init (uniform in `+-1 / sqrt(inpu
 | cuBLAS | 64 ms | 68 µs | 95.80% / 97.54% / 97.91% | 0.079 |
 
 - The two runs drift apart from the first epoch, though they start from the same weights and see the same batches: the sums inside the matmuls are added in a different order, and training makes the small differences grow. Both reach about 97.8%, and 99.7% on the training set, so the model is overfitting by epoch 10.
-- The blocked version is 6 times slower, and it's the matmuls. A batch of 64 gives the first layer's forward a single 128 x 128 block, and its weight gradient 7 blocks with 64 steps along the inner dimension each, so most of the 28 SMs sit idle (see the linear layer above). cuBLAS picks kernels for shapes like these.
+- The blocked version is 6 times slower, and it's the matmuls. A batch of 64 gives the first layer's forward a single 128 x 128 block, which walks all 784 inputs alone, and its weight gradient 7 blocks, so most of the 28 SMs sit idle (see the linear layer above). cuBLAS picks kernels for shapes like these.
 - macrograd takes about 0.7 seconds for one step of 32 images, so an epoch there is about 20 minutes. The GPU does a step of 64 in 68 µs with cuBLAS.
 
 ## References
