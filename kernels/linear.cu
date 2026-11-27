@@ -94,10 +94,28 @@ __device__ void load_tiles(const float *A, const float *B, float *As, float *Bs,
 //   C = A @ B + bias          when bias is given (one value per column)
 //   C = C + A @ B             when accumulate is set
 // with several, block z writes its partial sum to the z-th M x N slice of C, which is
-// then a scratch buffer, and add_parts finishes the job
+// then a scratch buffer, and add_parts finishes the job.
+// Finish can then fold an elementwise step into the same write, for a training loop that
+// wants fewer kernels: relu(C), or C set to 0 wherever mask <= 0 (the backward of a relu,
+// whose output is the mask). both come after the bias and the accumulate
+struct Finish {
+    bool relu = false;
+    const float *mask = nullptr;  // M x N, like C
+};
+
+__device__ float finish(float v, Finish f, size_t i) {
+    if (f.relu) {
+        v = fmaxf(v, 0.0f);
+    }
+    if (f.mask && f.mask[i] <= 0.0f) {
+        v = 0.0f;
+    }
+    return v;
+}
+
 template <typename T, bool TA, bool TB>
 __global__ void matmul_2d(const float *A, const float *B, float *C, const float *bias, bool accumulate,
-                          int M, int N, int K, int k_chunk) {
+                          int M, int N, int K, int k_chunk, Finish fin) {
     constexpr int BM = T::BM, BN = T::BN, BK = T::BK, TM = T::TM, TN = T::TN;
     __shared__ float As[BM * BK];
     __shared__ float Bs[BK * BN];
@@ -137,6 +155,7 @@ __global__ void matmul_2d(const float *A, const float *B, float *C, const float 
                     if (accumulate) {
                         v += C[(size_t)r * N + c];
                     }
+                    v = finish(v, fin, (size_t)r * N + c);
                 }
                 out[(size_t)r * N + c] = v;
             }
@@ -146,7 +165,8 @@ __global__ void matmul_2d(const float *A, const float *B, float *C, const float 
 
 // adds the parts in order z = 0, 1, 2, ..., so the result is the same on every run, then
 // the bias or what C held
-__global__ void add_parts(const float *parts, int count, float *C, const float *bias, bool accumulate, int M, int N) {
+__global__ void add_parts(const float *parts, int count, float *C, const float *bias, bool accumulate, int M, int N,
+                          Finish fin) {
     size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     size_t MN = (size_t)M * N;
     if (i < MN) {
@@ -160,7 +180,7 @@ __global__ void add_parts(const float *parts, int count, float *C, const float *
         if (accumulate) {
             v += C[i];
         }
-        C[i] = v;
+        C[i] = finish(v, fin, i);
     }
 }
 
@@ -189,18 +209,19 @@ int sm_count() {
 }
 
 template <typename T, bool TA, bool TB>
-void run(const float *A, const float *B, float *C, const float *bias, bool accumulate, int M, int N, int K, int splits) {
+void run(const float *A, const float *B, float *C, const float *bias, bool accumulate, int M, int N, int K, int splits,
+         Finish fin = {}) {
     // parts of K a whole number of BK steps long, and no empty ones
     int k_chunk = ((K + splits - 1) / splits + T::BK - 1) / T::BK * T::BK;
     splits = (K + k_chunk - 1) / k_chunk;
     dim3 grid((N + T::BN - 1) / T::BN, (M + T::BM - 1) / T::BM, splits);
     if (splits == 1) {
-        matmul_2d<T, TA, TB><<<grid, T::THREADS>>>(A, B, C, bias, accumulate, M, N, K, k_chunk);
+        matmul_2d<T, TA, TB><<<grid, T::THREADS>>>(A, B, C, bias, accumulate, M, N, K, k_chunk, fin);
     } else {
         float *parts = parts_buffer((size_t)splits * M * N);
-        matmul_2d<T, TA, TB><<<grid, T::THREADS>>>(A, B, parts, nullptr, false, M, N, K, k_chunk);
+        matmul_2d<T, TA, TB><<<grid, T::THREADS>>>(A, B, parts, nullptr, false, M, N, K, k_chunk, Finish{});
         size_t MN = (size_t)M * N;
-        add_parts<<<(unsigned)((MN + THREADS - 1) / THREADS), THREADS>>>(parts, splits, C, bias, accumulate, M, N);
+        add_parts<<<(unsigned)((MN + THREADS - 1) / THREADS), THREADS>>>(parts, splits, C, bias, accumulate, M, N, fin);
     }
 }
 
@@ -217,19 +238,19 @@ enum Plan { FIXED, AUTO, SPLIT };
 
 template <bool TA, bool TB>
 void matmul(const float *A, const float *B, float *C, const float *bias, bool accumulate, int M, int N, int K,
-            Plan plan = AUTO) {
+            Plan plan = AUTO, Finish fin = {}) {
     if (plan == FIXED) {
-        run<Big, TA, TB>(A, B, C, bias, accumulate, M, N, K, 1);
+        run<Big, TA, TB>(A, B, C, bias, accumulate, M, N, K, 1, fin);
         return;
     }
     if (plan == SPLIT) {
-        run<Small, TA, TB>(A, B, C, bias, accumulate, M, N, K, std::min(4, (K + 7) / 8));
+        run<Small, TA, TB>(A, B, C, bias, accumulate, M, N, K, std::min(4, (K + 7) / 8), fin);
         return;
     }
     long sms = sm_count();
     long big = (long)((M + 127) / 128) * ((N + 127) / 128);
     if (big >= 8 * sms) {
-        run<Big, TA, TB>(A, B, C, bias, accumulate, M, N, K, 1);
+        run<Big, TA, TB>(A, B, C, bias, accumulate, M, N, K, 1, fin);
         return;
     }
     long small = (long)((M + 63) / 64) * ((N + 63) / 64);
@@ -237,7 +258,7 @@ void matmul(const float *A, const float *B, float *C, const float *bias, bool ac
     if (small < 2 * sms) {
         splits = (int)std::min<long>((2 * sms + small - 1) / small, std::max(1, K / 32));
     }
-    run<Small, TA, TB>(A, B, C, bias, accumulate, M, N, K, splits);
+    run<Small, TA, TB>(A, B, C, bias, accumulate, M, N, K, splits, fin);
 }
 
 // ---- db: column sums ----
@@ -246,7 +267,8 @@ void matmul(const float *A, const float *B, float *C, const float *bias, bool ac
 // threads of a warp take neighbouring columns, so each row is read in one go, and the 8
 // warps take every 8th row. then the 8 partial sums of each column are added in shared
 // memory, always in the same order, so the result doesn't change from run to run
-__global__ void column_sum(const float *dy, float *db, int R, int O) {
+// with add false it overwrites db instead
+__global__ void column_sum(const float *dy, float *db, int R, int O, bool add) {
     __shared__ float part[8][32];
     int c = blockIdx.x * 32 + threadIdx.x;
     float s = 0.0f;
@@ -262,12 +284,12 @@ __global__ void column_sum(const float *dy, float *db, int R, int O) {
         for (int w = 0; w < 8; w++) {
             total += part[w][threadIdx.x];
         }
-        db[c] += total;
+        db[c] = (add ? db[c] : 0.0f) + total;
     }
 }
 
-void launch_column_sum(const float *dy, float *db, int R, int O) {
-    column_sum<<<(O + 31) / 32, dim3(32, 8)>>>(dy, db, R, O);
+void launch_column_sum(const float *dy, float *db, int R, int O, bool add = true) {
+    column_sum<<<(O + 31) / 32, dim3(32, 8)>>>(dy, db, R, O, add);
 }
 
 // ---- the layer ----
