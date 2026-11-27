@@ -281,6 +281,16 @@ I put 13 deliberate bugs into copies of the file and 12 fail the test. The one t
 
 I put 8 deliberate bugs into copies of the file. Five failed the first tests, and the two above failed once the large-score test was added. The one that passes removes a `__syncthreads` in the block sum, a race that didn't show up on this GPU.
 
+### Rotary position embedding
+
+`kernels/rope.cu` is macrograd's `rotary_embedding` for `(..., T, d)`: each pair of features at position `p` is turned by the angle `p * base^(-2i/d)`, and the backward turns each pair's gradient back by the same angle and adds it into `dx`. The angles get large: at position 100,000 the fastest pair has turned 100,000 radians, and a float angle there is off by up to 0.004 radians. So the CPU works out `cos` and `sin` in double for the `T` positions once, and the kernels, one thread per pair, read them from a `(T, d/2)` table.
+
+- Against macrograd starting at position 5: within 7.7e-8.
+- 6 shapes against a CPU version in double, from one pair to heads of 128 and a start at position 100,000: largest error 1.2e-7 relative to the pair's size. The backward of the forward gives `x` back within 1.8e-7. Working out the angles in float on the GPU instead fails the test on the late start.
+- On 2^24 values the forward takes 0.375 ms (358 GB/s) and the backward 0.563 ms (358 GB/s at 12 bytes a value), both at `cudaMemcpy` speed.
+
+All 7 deliberate bugs I put into copies of the file fail the test.
+
 ### Attention backward
 
 `kernels/attention_backward.cu` gives the gradients of `out = P @ v`, `P = softmax(q @ k^T / sqrt(d) + mask)`, added into `dq`, `dk` and `dv`:
