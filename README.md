@@ -331,6 +331,34 @@ The first MNIST layer's forward is 18 times faster and level with cuBLAS. Traini
 
 The test now runs every shape three ways: the fixed kernel, the automatic choice, and a forced split into up to 4 parts with 64 x 64 blocks, so the split code is checked on every shape, not only the ones that pick it. I put 11 deliberate bugs into the new code and 5 fail the test. The other 6 don't change any result. Two load up to `K` instead of the end of the block's part, but parts are always whole tile steps long, so no tile crosses one. One doesn't round the parts to whole tile steps, and one doesn't recount the parts, which only makes uneven or empty parts, and an empty part adds 0. One runs the bias step on split launches, which get no bias. One changes the load loop's stride so some floats are loaded twice, with the same values.
 
+### MNIST: a CUDA graph for the training step
+
+A training step is about 15 launches. A CUDA graph records the launches of one step once, and then the whole step goes to the GPU in one call. A recorded graph replays the same arguments every time, so the batch number lives on the GPU: the gather kernel reads it and a one-thread kernel moves it on at the end of the step. Recording needs a stream other than the legacy default one, so `mnist/train_mlp.cu` now builds with `--default-stream per-thread` and gives cuBLAS the same stream. The graph gives exactly the same test loss as plain launches, which the program checks.
+
+| Matmuls | Plain launches | CUDA graph |
+|---|---|---|
+| blocked | 85.0 ms per epoch | 84.0 ms |
+| cuBLAS | 63.8 ms | 66.9 ms |
+
+(epoch 10 of each run; the first epoch of a run with plain launches is up to 20% slower.)
+
+The graph saves 1% with the blocked matmuls and costs 5% with cuBLAS. The CPU wasn't what the step waited for: it queues launches faster than the GPU runs them. Each part of a step timed alone on the GPU (µs, batch 64):
+
+| Part | Blocked | cuBLAS |
+|---|---|---|
+| gather the batch | 3.7 | 3.6 |
+| layer 1 forward | 18.2 | 17.4 |
+| relu | 1.7 | 1.8 |
+| layer 2 forward | 10.3 | 7.1 |
+| loss (2 kernels) | 7.4 | 7.7 |
+| zero the gradients (4 memsets) and loss backward | 11.4 | 11.3 |
+| layer 2 backward and relu backward | 23.6 | 12.6 |
+| layer 1 backward | 21.2 | 10.8 |
+| SGD | 3.1 | 3.1 |
+| sum | 100.8 | 75.3 |
+
+The parts add up to a bit more than a real step (90 and 68 µs), since each was timed alone. A kernel that does almost nothing still takes 2 to 4 µs on the GPU itself: the relu on 8192 values takes 1.7, and the 4 memsets and one small kernel take 11.4. So at this size the step is set by how many kernels it has, which a graph doesn't change. Doing more in each kernel would: relu inside the first layer's matmul, the loss and its backward in one kernel, and gradients that the first write overwrites instead of adding to zeroed memory.
+
 ## References
 
 - [How to Optimize a CUDA Matmul Kernel for cuBLAS-like Performance](https://siboehm.com/articles/22/CUDA-MMM), Simon Boehm

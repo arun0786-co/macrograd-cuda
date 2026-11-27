@@ -13,12 +13,19 @@
 // read and skip them.
 //
 //   ./build/train_mlp           trains for EPOCHS epochs with the blocked matmul, then
-//                               again with cuBLAS, and prints time and test accuracy
+//                               again with cuBLAS, each once with plain launches and once
+//                               with a CUDA graph, and prints time and test accuracy
 //   ./build/train_mlp --check   runs the first 20 steps from fixed weights and compares
 //                               the losses with macrograd's (tests/mnist_macrograd.txt)
 //
+// a step is about 15 kernel launches, and the CPU spends a few microseconds on each. a CUDA
+// graph records the launches of one step once, and then the whole step goes to the GPU in
+// one call. only work on a stream that isn't the legacy default stream can be recorded, so
+// this builds with --default-stream per-thread, which gives every <<<>>> launch without a
+// stream, and every async call with stream 0, the thread's own stream instead.
+//
 // needs data/mnist (python3 mnist/get_mnist.py). build and run from the repo root:
-//   nvcc -O3 -arch=native -std=c++17 mnist/train_mlp.cu -lcublas -o build/train_mlp && ./build/train_mlp
+//   nvcc -O3 -arch=native -std=c++17 --default-stream per-thread mnist/train_mlp.cu -lcublas -o build/train_mlp && ./build/train_mlp
 
 #include <algorithm>
 #include <cmath>
@@ -94,6 +101,23 @@ __global__ void gather(const float *images, const int *labels, const int *idx, f
     }
 }
 
+// gather for the batch at step *step of the shuffled order. a recorded graph replays the
+// same arguments every time, so the step number lives on the GPU and next_step moves it
+__global__ void gather_step(const float *images, const int *labels, const int *idx, const int *step, float *xb,
+                            int *yb, int B) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < (size_t)B * IN) {
+        const int *batch = idx + (size_t)*step * B;
+        int r = i / IN, j = i % IN;
+        xb[i] = images[(size_t)batch[r] * IN + j];
+        if (j == 0) {
+            yb[r] = labels[batch[r]];
+        }
+    }
+}
+
+__global__ void next_step(int *step) { *step += 1; }
+
 // one thread per row: is the largest score at the label? ties go to the lower class
 __global__ void count_correct(const float *logits, const int *labels, int *correct, int B) {
     int r = blockIdx.x * blockDim.x + threadIdx.x;
@@ -122,7 +146,7 @@ struct Net {
     // activations and their gradients for one batch
     float *xb, *h_pre, *h, *logits, *dlogits, *dh, *dh_pre, *row_loss, *loss, *dloss;
     float2 *stats;
-    int *yb, *idx, *correct;
+    int *yb, *idx, *correct, *step_number;
     bool cublas;
 
     void forward(int B) {
@@ -160,6 +184,22 @@ struct Net {
         backward(B);
         sgd.step(params, grads, vel, PARAMS);
     }
+
+    // a full batch of BATCH, recorded into a graph: the batch comes from step_number
+    cudaGraphExec_t record_step(const float *images, const int *labels, opt::SGD &sgd) {
+        cudaGraph_t graph;
+        cudaGraphExec_t exec;
+        CUDA_CHECK(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeGlobal));
+        gather_step<<<blocks((size_t)BATCH * IN), THREADS>>>(images, labels, idx, step_number, xb, yb, BATCH);
+        forward(BATCH);
+        backward(BATCH);
+        sgd.step(params, grads, vel, PARAMS);
+        next_step<<<1, 1>>>(step_number);
+        CUDA_CHECK(cudaStreamEndCapture(cudaStreamPerThread, &graph));
+        CUDA_CHECK(cudaGraphInstantiate(&exec, graph, 0));
+        CUDA_CHECK(cudaGraphDestroy(graph));
+        return exec;
+    }
 };
 
 Net make_net() {
@@ -180,6 +220,7 @@ Net make_net() {
     CUDA_CHECK(cudaMalloc(&n.yb, rows * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&n.idx, 60000 * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&n.correct, sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&n.step_number, sizeof(int)));
     float one = 1.0f;  // the loss is the output, so its gradient is 1
     CUDA_CHECK(cudaMemcpy(n.dloss, &one, sizeof(float), cudaMemcpyHostToDevice));
     return n;
@@ -291,45 +332,131 @@ bool check(Net &net, const DeviceSplit &train) {
     return ok;
 }
 
-void train(Net &net, const DeviceSplit &trainset, const DeviceSplit &testset) {
+// returns the test loss after the last epoch, so the runs with and without a graph can
+// be compared
+double train_once(Net &net, const DeviceSplit &trainset, const DeviceSplit &testset, bool cublas, bool graph) {
+    net.cublas = cublas;
+    std::mt19937 rng(0);
+    opt::SGD sgd{LR, MOMENTUM, 0.0f};
+    std::vector<int> order(trainset.n);
+    std::iota(order.begin(), order.end(), 0);
+    // one step before the real start, so the scratch buffers and cuBLAS's workspace are
+    // allocated now: a recorded graph can't allocate. its weight changes are thrown away
+    CUDA_CHECK(cudaMemcpy(net.idx, order.data(), order.size() * sizeof(int), cudaMemcpyHostToDevice));
+    net.step(trainset.images, trainset.labels, net.idx, BATCH, sgd);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    upload(net.params, random_init(rng));
+    CUDA_CHECK(cudaMemset(net.vel, 0, PARAMS * sizeof(float)));
+    cudaGraphExec_t exec = nullptr;
+    if (graph) {
+        exec = net.record_step(trainset.images, trainset.labels, sgd);
+    }
+    printf("\n%s matmuls, %s, batch %d, SGD lr %.2f momentum %.1f\n", cublas ? "cuBLAS" : "blocked",
+           graph ? "CUDA graph" : "plain launches", BATCH, LR, MOMENTUM);
+    cudaEvent_t start, stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+    double total_ms = 0.0, test_loss = 0.0;
+    int full = trainset.n / BATCH;  // 937 full batches, then one of 32
+    for (int epoch = 1; epoch <= EPOCHS; epoch++) {
+        std::shuffle(order.begin(), order.end(), rng);
+        CUDA_CHECK(cudaEventRecord(start));
+        CUDA_CHECK(cudaMemcpyAsync(net.idx, order.data(), order.size() * sizeof(int), cudaMemcpyHostToDevice));
+        if (graph) {
+            CUDA_CHECK(cudaMemsetAsync(net.step_number, 0, sizeof(int)));
+            for (int s = 0; s < full; s++) {
+                CUDA_CHECK(cudaGraphLaunch(exec, cudaStreamPerThread));
+            }
+        } else {
+            for (int s = 0; s < full; s++) {
+                net.step(trainset.images, trainset.labels, net.idx + s * BATCH, BATCH, sgd);
+            }
+        }
+        // the last, smaller batch is launched the plain way in both
+        int first = full * BATCH;
+        if (first < trainset.n) {
+            net.step(trainset.images, trainset.labels, net.idx + first, trainset.n - first, sgd);
+        }
+        CUDA_CHECK(cudaEventRecord(stop));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+        CUDA_CHECK(cudaGetLastError());
+        float ms;
+        CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
+        total_ms += ms;
+        double train_loss, train_acc, test_acc;
+        evaluate(net, trainset.images, trainset.labels, trainset.n, &train_loss, &train_acc);
+        evaluate(net, testset.images, testset.labels, testset.n, &test_loss, &test_acc);
+        printf("epoch %2d | %6.1f ms | train loss %.4f acc %.2f%% | test loss %.4f acc %.2f%%\n", epoch, ms, train_loss,
+               100 * train_acc, test_loss, 100 * test_acc);
+    }
+    int steps = (trainset.n + BATCH - 1) / BATCH;
+    printf("%.1f ms per epoch, %.1f us per step\n", total_ms / EPOCHS, 1000 * total_ms / EPOCHS / steps);
+    if (exec) {
+        CUDA_CHECK(cudaGraphExecDestroy(exec));
+    }
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+    return test_loss;
+}
+
+// how long each part of a step takes on the GPU, each part repeated on its own, so the
+// CPU's launch cost doesn't count unless the GPU waits for it
+void breakdown(Net &net, const DeviceSplit &trainset) {
+    const int B = BATCH;
+    std::vector<int> order(trainset.n);
+    std::iota(order.begin(), order.end(), 0);
+    CUDA_CHECK(cudaMemcpy(net.idx, order.data(), order.size() * sizeof(int), cudaMemcpyHostToDevice));
+    std::mt19937 rng(0);
+    upload(net.params, random_init(rng));
+    opt::SGD sgd{LR, MOMENTUM, 0.0f};
+    net.step(trainset.images, trainset.labels, net.idx, B, sgd);  // fills every buffer
     for (bool cublas : {false, true}) {
         net.cublas = cublas;
-        std::mt19937 rng(0);
-        upload(net.params, random_init(rng));
-        CUDA_CHECK(cudaMemset(net.vel, 0, PARAMS * sizeof(float)));
-        opt::SGD sgd{LR, MOMENTUM, 0.0f};
-        std::vector<int> order(trainset.n);
-        std::iota(order.begin(), order.end(), 0);
-        printf("\n%s matmuls, batch %d, SGD lr %.2f momentum %.1f\n", cublas ? "cuBLAS" : "blocked", BATCH, LR, MOMENTUM);
-        cudaEvent_t start, stop;
-        CUDA_CHECK(cudaEventCreate(&start));
-        CUDA_CHECK(cudaEventCreate(&stop));
-        double total_ms = 0.0;
-        for (int epoch = 1; epoch <= EPOCHS; epoch++) {
-            std::shuffle(order.begin(), order.end(), rng);
-            CUDA_CHECK(cudaEventRecord(start));
-            CUDA_CHECK(cudaMemcpyAsync(net.idx, order.data(), order.size() * sizeof(int), cudaMemcpyHostToDevice));
-            // the last batch is smaller: 60000 = 937 * 64 + 32
-            for (int first = 0; first < trainset.n; first += BATCH) {
-                net.step(trainset.images, trainset.labels, net.idx + first, std::min(BATCH, trainset.n - first), sgd);
-            }
-            CUDA_CHECK(cudaEventRecord(stop));
-            CUDA_CHECK(cudaEventSynchronize(stop));
-            CUDA_CHECK(cudaGetLastError());
-            float ms;
-            CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
-            total_ms += ms;
-            double train_loss, train_acc, test_loss, test_acc;
-            evaluate(net, trainset.images, trainset.labels, trainset.n, &train_loss, &train_acc);
-            evaluate(net, testset.images, testset.labels, testset.n, &test_loss, &test_acc);
-            printf("epoch %2d | %6.1f ms | train loss %.4f acc %.2f%% | test loss %.4f acc %.2f%%\n", epoch, ms,
-                   train_loss, 100 * train_acc, test_loss, 100 * test_acc);
+        auto fwd = cublas ? lin::cublas_forward : lin::linear_forward;
+        auto bwd = cublas ? lin::cublas_backward : lin::linear_backward;
+        float t[9];
+        t[0] = lin::time_ms([&] { gather<<<blocks((size_t)B * IN), THREADS>>>(trainset.images, trainset.labels, net.idx, net.xb, net.yb, B); });
+        t[1] = lin::time_ms([&] { fwd(net.xb, net.params + W1, net.params + B1, net.h_pre, B, IN, HIDDEN); });
+        t[2] = lin::time_ms([&] { ew::forward_kernel<ew::Relu><<<blocks((size_t)B * HIDDEN), THREADS>>>(net.h_pre, net.h, B * HIDDEN); });
+        t[3] = lin::time_ms([&] { fwd(net.h, net.params + W2, net.params + B2, net.logits, B, HIDDEN, CLASSES); });
+        t[4] = lin::time_ms([&] { xent::cross_entropy(net.logits, net.yb, net.row_loss, net.stats, net.loss, B, CLASSES); });
+        t[5] = lin::time_ms([&] {
+            CUDA_CHECK(cudaMemsetAsync(net.grads, 0, PARAMS * sizeof(float)));
+            CUDA_CHECK(cudaMemsetAsync(net.dlogits, 0, (size_t)B * CLASSES * sizeof(float)));
+            CUDA_CHECK(cudaMemsetAsync(net.dh, 0, (size_t)B * HIDDEN * sizeof(float)));
+            CUDA_CHECK(cudaMemsetAsync(net.dh_pre, 0, (size_t)B * HIDDEN * sizeof(float)));
+            xent::cross_entropy_backward(net.logits, net.yb, net.stats, net.dloss, net.dlogits, B, CLASSES);
+        });
+        t[6] = lin::time_ms([&] {
+            bwd(net.h, net.params + W2, net.dlogits, net.dh, net.grads + W2, net.grads + B2, B, HIDDEN, CLASSES);
+            ew::backward_kernel<ew::Relu><<<blocks((size_t)B * HIDDEN), THREADS>>>(net.h_pre, net.dh, net.dh_pre, B * HIDDEN);
+        });
+        t[7] = lin::time_ms([&] { bwd(net.xb, net.params + W1, net.dh_pre, nullptr, net.grads + W1, net.grads + B1, B, IN, HIDDEN); });
+        t[8] = lin::time_ms([&] { sgd.step(net.params, net.grads, net.vel, PARAMS); });
+        const char *what[] = {"gather", "layer 1 forward", "relu", "layer 2 forward", "loss", "zero grads + loss backward",
+                              "layer 2 backward + relu backward", "layer 1 backward", "sgd"};
+        printf("\n%s matmuls, one step of %d, each part alone:\n", cublas ? "cuBLAS" : "blocked", B);
+        float total = 0;
+        for (int k = 0; k < 9; k++) {
+            printf("  %-34s %7.1f us\n", what[k], 1000 * t[k]);
+            total += t[k];
         }
-        int steps = (trainset.n + BATCH - 1) / BATCH;
-        printf("%.1f ms per epoch, %.1f us per step\n", total_ms / EPOCHS, 1000 * total_ms / EPOCHS / steps);
-        CUDA_CHECK(cudaEventDestroy(start));
-        CUDA_CHECK(cudaEventDestroy(stop));
+        printf("  %-34s %7.1f us\n", "sum", 1000 * total);
     }
+}
+
+// the graph replays the same kernels in the same order, so it has to give exactly the
+// same weights, and so the same test loss to the last bit
+bool train(Net &net, const DeviceSplit &trainset, const DeviceSplit &testset) {
+    bool ok = true;
+    for (bool cublas : {false, true}) {
+        double plain = train_once(net, trainset, testset, cublas, false);
+        double graphed = train_once(net, trainset, testset, cublas, true);
+        bool same = plain == graphed;
+        printf("same test loss with and without the graph: %s\n", same ? "yes" : "NO");
+        ok = ok && same;
+    }
+    return ok;
 }
 
 int main(int argc, char **argv) {
@@ -338,6 +465,8 @@ int main(int argc, char **argv) {
     CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
     printf("gpu: %s, %d SMs\n", prop.name, prop.multiProcessorCount);
     CUBLAS_CHECK(cublasCreate(&lin::g_cublas));
+    // cuBLAS has to use the same stream as the kernels, or its calls wouldn't be recorded
+    CUBLAS_CHECK(cublasSetStream(lin::g_cublas, cudaStreamPerThread));
     Split tr = read_split("data/mnist/train-images-idx3-ubyte", "data/mnist/train-labels-idx1-ubyte");
     Split te = read_split("data/mnist/t10k-images-idx3-ubyte", "data/mnist/t10k-labels-idx1-ubyte");
     printf("%d training and %d test images\n", tr.n, te.n);
@@ -346,7 +475,8 @@ int main(int argc, char **argv) {
 
     bool ok = check(net, trainset);
     if (!check_only) {
-        train(net, trainset, testset);
+        breakdown(net, trainset);
+        ok = train(net, trainset, testset) && ok;
     }
     CUBLAS_CHECK(cublasDestroy(lin::g_cublas));
     printf("\n%s\n", ok ? "all ok" : "SOMETHING IS WRONG");
