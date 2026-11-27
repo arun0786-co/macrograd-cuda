@@ -157,6 +157,22 @@ GB/s counts each value once: 8 bytes for the forward (read `x`, write `y`), 16 f
 
 I put 15 deliberate bugs into copies of the file and 14 fail the test. The one that passes uses a warp per row for every width, which is still right, just slower. One more passed at first: without the check for rows past the end, the forward wrote past the end of `y`, which the test didn't look at. It does now.
 
+### RMS norm
+
+`kernels/rms_norm.cu` is macrograd's `rms_norm`, the norm LLaMA uses: `y = gamma * x / sqrt(mean(x^2) + eps)`, its backward `dx += rstd * (g - x_hat * mean(g * x_hat))` with `g = dy * gamma`, and `dgamma`. It's the layer norm kernels without the mean, the `mean(g)` term and `beta`. A sum of squares has nothing to cancel, so it doesn't need the first-value shift either. The layouts are the same: a warp or a block per row, and `dgamma` summed over parts of the rows and added in a fixed order.
+
+- Against macrograd with an all-zero row (so `1 / rms` is 316): within 2.1e-5 on values up to 442, 5e-8 of their size.
+- The same 46 shapes as layer norm, with rows near 1000 and all-zero rows: largest errors 2.3e-7 for `y`, 2.4e-7 for `dx` and 1.7e-7 for `dgamma`.
+
+| Rows x cols | Forward | `dx` | `dgamma` |
+|---|---|---|---|
+| 65536 x 256 | 0.886 ms, 151.5 GB/s | 1.670 ms, 160.8 GB/s | 0.410 ms, 327.6 GB/s |
+| 16384 x 1024 | 0.576 ms, 232.9 | 1.172 ms, 229.1 | 0.402 ms, 334.0 |
+| 4096 x 4096 | 0.542 ms, 247.4 | 1.145 ms, 234.4 | 0.389 ms, 344.7 |
+| 1024 x 16384 | 0.584 ms, 229.7 | 1.155 ms, 232.5 | 0.465 ms, 288.5 |
+
+The forward reads each row twice instead of three times and is 8 to 33% faster than layer norm's. All 11 deliberate bugs I put into copies of the file fail the test.
+
 ### Prefix sum (cumsum)
 
 `kernels/cumsum.cu` is macrograd's `cumsum` along the last axis, `out[k] = x[0] + ... + x[k]` on each row, and its backward, the same scan run from the end of the row and added into `dx`. Each thread scans 4 values of its own, the threads' totals are scanned across the block (5 `__shfl_up_sync` steps in each warp, then the same on the warps' totals), and each thread adds the total of everything before it. Two ways to lay it out:
