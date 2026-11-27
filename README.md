@@ -205,6 +205,31 @@ I put 13 deliberate bugs into copies of the file and 12 fail the test. The one t
 
 I put 8 deliberate bugs into copies of the file. Five failed the first tests, and the two above failed once the large-score test was added. The one that passes removes a `__syncthreads` in the block sum, a race that didn't show up on this GPU.
 
+### Attention, fused
+
+`kernels/attention_fused.cu` gives the same result as the naive version in one kernel that never writes the score matrix to memory, the idea behind flash attention (Dao et al., 2022). A block takes 64 queries of one head, one thread per query, and keeps the query row and the output row in registers. It walks the keys a tile at a time: the block loads the tile's keys and values into shared memory, each thread works out its scores and their max, scales its output row and running sum by `exp(m_old - m_new)` when the max goes up, and adds `exp(s - m) * v` for the tile. At the end it divides by the sum. With the causal mask, tiles past every query of the block are skipped. Head sizes are 16, 32, 64 and 128, with `d = d_v`.
+
+It matches the CPU version on 9 shapes for every head size, with and without the mask, within 1.3e-6, and passes the large-score test.
+
+16 heads, causal (ms; the naive and cuBLAS columns are the versions above):
+
+| d | T | Naive | cuBLAS matmuls | Fused | Score matrix the others store |
+|---|---|---|---|---|---|
+| 32 | 256 | 0.478 | 0.134 | 0.209 | 4.2 MB |
+| 32 | 1024 | 2.589 | 1.290 | 1.909 | 67 MB |
+| 32 | 4096 | 38.46 | 20.95 | 19.90 | 1074 MB |
+| 64 | 256 | 0.506 | 0.118 | 0.255 | 4.2 MB |
+| 64 | 1024 | 2.588 | 1.241 | 2.083 | 67 MB |
+| 64 | 4096 | 43.33 | 20.63 | 24.85 | 1074 MB |
+| 128 | 1024 | 4.229 | 1.421 | 7.610 | 67 MB |
+| 128 | 4096 | 68.19 | 23.84 | 96.61 | 1074 MB |
+
+- It needs no memory beyond its output, where the others need a GB for the scores at 4096. At `d = 32` and `T = 4096` it's also the fastest of the three, and it beats the naive version everywhere except at `d = 128`.
+- Mostly it's still slower than the cuBLAS version, though it does half the work by skipping masked tiles. Each thread does one multiply-add per float it reads from shared memory, the same ratio as the tiled matmul, and its blocks are small: 64 threads with 127 to 255 registers each, so an SM holds 4 to 6 warps. At `d = 128` it runs out of registers and spills 120 bytes per thread.
+- Flash attention gets its speed from doing the two products the way a fast matmul does: several threads per query and register blocking over both queries and keys. That's the next step.
+
+I put 12 deliberate bugs into copies of the file and 9 fail the test. Two of the three that pass remove checks that can't be hit: the guard for a tile with no key the query may see (a query always sees key 0, so its first tile always has one), and the check for keys past the end (the mask already stops before it). The third removes the `__syncthreads` after loading a tile, a race that didn't show up with 2 warps per block.
+
 ### Matmul: naive
 
 `C = A @ B` for square matrices, one thread per value of `C`, blocks of 32 x 32 threads. GFLOPS counts a multiply and an add for each of the `n^3` terms. Inputs are uniform in [-1, 1]. The error is `|gpu - ref| / sum_k |A[i][k] B[k][j]|` against a CPU matmul in double precision, over every value up to 1024 x 1024 and over 4100 sampled values above that. The last column is the time of `cublasSgemm` divided by the kernel's time.
