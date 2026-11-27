@@ -171,7 +171,32 @@ I put 15 deliberate bugs into copies of the file and 14 fail the test. The one t
 | 4096 x 4096 | 0.542 ms, 247.4 | 1.145 ms, 234.4 | 0.389 ms, 344.7 |
 | 1024 x 16384 | 0.584 ms, 229.7 | 1.155 ms, 232.5 | 0.465 ms, 288.5 |
 
-The forward reads each row twice instead of three times and is 8 to 33% faster than layer norm's. All 11 deliberate bugs I put into copies of the file fail the test.
+The forward reads each row twice instead of three times and is 8 to 32% faster than layer norm's. All 11 deliberate bugs I put into copies of the file fail the test.
+
+### Embedding
+
+`kernels/embedding.cu` is macrograd's `embedding`: `out[n] = table[ids[n]]`, and the backward `dtable[ids[n]] += dout[n]`. The forward is a gather with one thread per value, and an id outside the table gives a row of NaN. The backward is where it gets interesting, since threads that have the same id write to the same row. There are two versions:
+
+1. Atomic: one thread per value of `dout`, each doing `atomicAdd` into the table. The adds to one place happen in whatever order the threads arrive, so the rounding isn't fixed from run to run.
+2. Sorted: sort the `(id, n)` pairs with `cub`'s radix sort, which keeps equal ids in order of `n`, find each id's run with `cub`'s run-length encoding and a scan, then one block per distinct id adds up its rows in that order. The result is the same on every run, and the test checks that.
+
+Both match macrograd (with ids repeated up to 4 times) within 8.4e-8, and a CPU version in double on 8 shapes, from 1 id to a 50257-row table, within 1.6e-7 relative to the sum of what went into each row.
+
+65536 ids, rows of 256 (ms):
+
+| Table rows | Forward | Atomic backward | Sorted backward |
+|---|---|---|---|
+| 10 | 0.414 | 1.195 | 1.244 |
+| 100 | 0.412 | 0.624 | 0.304 |
+| 1000 | 0.419 | 0.598 | 0.339 |
+| 10000 | 0.482 | 0.645 | 0.409 |
+| 50257 | 0.492 | 0.647 | 0.723 |
+
+- The sorted backward is faster from 100 to 10000 rows, up to 2 times, though it sorts first. Each block reads its rows and writes the sum once, and the atomics pay for every one of their 16.8M adds.
+- With 10 rows, each id is repeated 6500 times. The atomics queue on the same 2560 addresses, and the sorted version has only 10 blocks of work. Both take about 1.2 ms.
+- With 50257 rows most ids appear once or twice, so the sort is mostly overhead and atomics win.
+
+I put 9 deliberate bugs into copies of the file and all fail the test. One passed at first: without the check that stops blocks past the number of distinct ids, those blocks read runs left over from an earlier call, and the scratch memory happened to hold zeros, which add nothing. The test now plants a fake run of length 1 there before each call.
 
 ### Prefix sum (cumsum)
 
