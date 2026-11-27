@@ -176,8 +176,12 @@ __global__ void ce_backward(const float *x, const int *labels, const float2 *sta
     }
     int r = i / C, j = i % C;
     float2 s = stats[r];
-    float p = expf(x[i] - s.x) * s.y;
-    dx[i] += *dloss / R * (p - (j == labels[r] ? 1.0f : 0.0f));
+    // the _rn intrinsics round every step on its own. without them the compiler may fuse
+    // a multiply and the next add into one fma, rounded once, and whether it does depends
+    // on the code around it. mnist/train_mlp.cu's fused step does the same arithmetic in
+    // another kernel and has to match this one to the bit
+    float p = __fmul_rn(expf(x[i] - s.x), s.y);
+    dx[i] = __fadd_rn(dx[i], __fmul_rn(*dloss / R, __fsub_rn(p, j == labels[r] ? 1.0f : 0.0f)));
 }
 
 // ---- launches ----
