@@ -24,7 +24,7 @@ Forward and backward written by hand for each layer, no autograd.
 
 - [x] linear layer forward and backward
 - [x] cross entropy forward and backward
-- [ ] SGD and Adam update kernels
+- [x] SGD and Adam update kernels
 - [ ] full training loop on the GPU, matching macrograd's loss on a small model with the same weights
 
 ### 3. Results
@@ -222,6 +222,23 @@ Rows are given to threads three ways: a thread per row, a warp per row, or a blo
 - The backward runs at 324 to 354 GB/s at every shape, since it is one thread per logit.
 
 The test checks the backward formula against finite differences of the CPU loss (4.9e-11), and 71 shapes against a CPU version in double, with every version: 1 to 2500 rows and 1 to 5000 classes, around a warp, a block and the 1024 switch. Rows are uniform in [-10, 10], some shifted by +1000 or -1000 and some with every fourth logit at -inf, and the labels include the first and last column. The largest error was 3.6e-7 for the loss, relative to `1 + |m|`, and 5.0e-8 for `dx`. I put 18 deliberate bugs into copies of the file and 17 fail the test. The one that passes removes the `__syncthreads` between the steps of the mean's tree sum, a race that didn't show on this GPU.
+
+### SGD and Adam
+
+`kernels/optim.cu` has one-thread-per-weight steps for SGD with momentum and weight decay, and for Adam and AdamW (Adam is AdamW with no weight decay), with the same formulas as macrograd's `optim.py`. The CPU works out the numbers that only depend on the settings and the step, like Adam's bias corrections `1 / (1 - beta^t)`, in double once per step and passes them in. `1 - beta2` is one of those numbers. 0.999 isn't exact in float, and `1.0f - 0.999f` is 0.00099998713, 1.3e-5 away from 0.001. Computed on the GPU, it moved every Adam step by about 6e-6 of its size, 100 times a float rounding, and the test caught it.
+
+- Five steps of each optimizer against macrograd on the same weights and gradients, with one gradient of 1e-7 so Adam's `eps` matters (`tests/make_optim_fixture.py`): largest differences 9.7e-8 for SGD, 1.0e-7 for Adam and 1.3e-7 for AdamW.
+- One step against a CPU version in double from random weights, gradients and optimizer state, on 1 to 2^20 + 3 weights and at Adam steps 1, 2 and 1000: largest error 1.3e-7 for SGD and 2.3e-7 for AdamW, relative to the size of what went into each value.
+- Nothing is written past the end.
+
+| Weights | SGD | AdamW |
+|---|---|---|
+| 101,770 (the MNIST MLP) | 0.0031 ms, 665 GB/s | 0.0046 ms, 624 GB/s |
+| 2^24 | 0.969 ms, 346 GB/s | 1.436 ms, 327 GB/s |
+
+SGD moves 20 bytes per weight (reads the weight, gradient and velocity, writes the weight and velocity) and AdamW 28. `cudaMemcpy` does 357 GB/s. At 2^24 weights the steps run at 97% and 92% of copy speed, so there is little left to gain. The MNIST-sized steps go faster than memory allows because the 2 to 3 MB they touch stays in the 2.75 MB L2 cache between repeats. In a training loop the forward and backward run in between and push it out.
+
+I put 16 deliberate bugs into copies of the file and 15 fail the test. The one that passes reads `m[i]` back right after writing it, which gives the same number. Two bugs that update one weight past the end passed at first: the memory there was NaN, and an update of NaN writes NaN back. The test now fills the space after the end with 3.0 instead.
 
 ## References
 
