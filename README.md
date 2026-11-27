@@ -173,6 +173,23 @@ The largest error was 2.9e-7 over the square sizes. The three runs agree within 
 
 The test also checks that nothing is written up to 128 rows past the end of `C`. I added that after a bug that removed the 2d kernel's row check passed. I put 17 deliberate bugs into copies of the file and 14 fail the test. Two of the three that pass remove a bounds check on the rows of `A` or the columns of `B`. Those values only go into values of `C` outside the matrix, which are never written, though the kernel does read past the end of `A` or into the next row of `B`. The third removes the last `__syncthreads` of the 2d loop, so a thread can load the next tile while another still reads this one. That is a race, but it didn't show up in these runs on this GPU.
 
+### Matmul: 128-bit loads and a transposed A tile
+
+A third version in `kernels/matmul_blocked.cu` keeps the 2d kernel's 128 x 128 blocks and 8 x 8 values per thread, but moves 4 floats at a time: every global load, every shared memory read and the final store are `float4`. The `A` tile is also stored transposed in shared memory, so a thread's 8 values of `A` for one `k` sit next to each other and take 2 reads instead of 8. `float4` needs 16-byte aligned addresses, so it only runs when `K` and `N` are multiples of 4, and falls back to the 2d kernel otherwise. The test has 8 shapes that take the `float4` path, some with `M`, `N` or `K` that don't fill a block or a step of 8.
+
+| Kernel | 256 | 512 | 1024 | 2048 | 4096 | 4096, of cuBLAS |
+|---|---|---|---|---|---|---|
+| 2d | 262.4 GFLOPS | 933.2 | 1486.1 | 3247.4 | 3615.1 (38.0 ms) | 37.1% |
+| 2d, float4 | 570.3 | 2059.9 | 3708.9 | 6622.9 | 6984.9 (19.7 ms) | 71.6% |
+| `cublasSgemm` | 3257 | 4410 | 7587 | 9961 | 9749 (14.1 ms) | 100% |
+
+From the second of two runs, which agreed within 2% except cuBLAS at 2048 (2.07 then 1.73 ms). The largest error was 2.9e-7.
+
+- The `float4` version is 1.9 to 2.5 times faster than the 2d one at every size, and reaches 72% of cuBLAS at 4096. That's a lot for the same arithmetic, which says the 2d kernel was limited by the number of load instructions, not by memory or math: per `k` a thread now issues 4 shared memory reads instead of 16.
+- It is still slow at 256, where 4 blocks of 128 x 128 leave 24 SMs idle. The split-K layouts from the linear layer would help there.
+
+I put 13 deliberate bugs into the new kernel and 9 fail the test. Two of the four that pass remove the bounds check on the rows of `A` or the columns of `B`, which only changes values of `C` that are never written, as in the other matmuls. One removes the `__syncthreads` at the end of the loop, a race that didn't show up. One gives the threads a different but complete mapping of the `B` tile, which isn't a bug.
+
 ### Matmul: what each kernel asks of the GPU
 
 Nsight Compute needs the GPU's performance counters, and the cluster only lets admins read them (`ERR_NVGPUCTRPERM`). `bench/matmul_resources.cu` gets what it can without them: each kernel's registers, shared memory and spills from the compiler, how many blocks fit on an SM from the occupancy calculator, its time at 4096, and from its design, how many floats it must read from global memory. The GPU has 28 SMs, 64 warps, 65,536 registers and 96 KB of shared memory per SM, 11.3 TFLOPS at 1.58 GHz and 484 GB/s.

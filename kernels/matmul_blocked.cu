@@ -13,6 +13,11 @@
 // 2. 2d blocking: blocks of 128 x 128 values of C, 256 threads, each thread makes an
 //    8 x 8 square. for every k it reads 8 floats of the A tile and 8 of the B tile into
 //    registers and does all 64 multiply-adds between them: 16 reads for 64 multiply-adds.
+// 3. 2d blocking with 128-bit loads: the same blocks, but every load and shared memory
+//    read moves 4 floats at once (float4), and the A tile is stored transposed in shared
+//    memory, so a thread's 8 values of A for one k sit next to each other and come in 2
+//    reads instead of 8 (Boehm's kernel 6). float4 reads need 16-byte aligned addresses,
+//    so this only runs when K and N are multiples of 4; otherwise launch_vec uses 2.
 //
 // both walk along K BK = 8 columns at a time. the tiles are loaded into shared memory by
 // all the threads together, values past the edge of A or B loaded as 0, so any M, N, K
@@ -160,6 +165,70 @@ __global__ void matmul_2d(const float *A, const float *B, float *C, int M, int N
     }
 }
 
+// ---- 3. 2d blocking with float4 loads and a transposed A tile ----
+
+// BM = BN = 128, BK = 8, TM = TN = 8 and 256 threads, as in matmul_2d. K % 4 == 0 and
+// N % 4 == 0, so every float4 below starts on a 16-byte boundary, and a group of 4 is
+// either all inside the matrix or all outside it
+__global__ void matmul_2d_vec(const float *A, const float *B, float *C, int M, int N, int K) {
+    const int BM = 128, BN = 128, BK = 8, TM = 8, TN = 8;
+    __shared__ float4 As4[BK * BM / 4];  // As[k][r]: A's tile transposed, BK rows of BM
+    __shared__ float4 Bs4[BK * BN / 4];  // Bs[k][c]
+    float *As = (float *)As4, *Bs = (float *)Bs4;
+    int tcol = threadIdx.x % (BN / TN), trow = threadIdx.x / (BN / TN);
+    int row0 = blockIdx.y * BM, col0 = blockIdx.x * BN;
+    // each thread loads one float4 of each tile: of A, row threadIdx.x / 2 and columns
+    // 4 * (threadIdx.x % 2) to + 3; of B, row threadIdx.x / 32 and 4 columns from 4 * (threadIdx.x % 32)
+    int a_r = threadIdx.x / 2, a_c = 4 * (threadIdx.x % 2);
+    int b_r = threadIdx.x / 32, b_c = 4 * (threadIdx.x % 32);
+    float acc[TM][TN] = {};
+    float a[TM], b[TN];
+    for (int k0 = 0; k0 < K; k0 += BK) {
+        float4 av = make_float4(0.0f, 0.0f, 0.0f, 0.0f), bv = av;
+        if (row0 + a_r < M && k0 + a_c < K) {
+            av = *(const float4 *)&A[(size_t)(row0 + a_r) * K + k0 + a_c];
+        }
+        // transposed as it goes into shared memory
+        As[(a_c + 0) * BM + a_r] = av.x;
+        As[(a_c + 1) * BM + a_r] = av.y;
+        As[(a_c + 2) * BM + a_r] = av.z;
+        As[(a_c + 3) * BM + a_r] = av.w;
+        if (k0 + b_r < K && col0 + b_c < N) {
+            bv = *(const float4 *)&B[(size_t)(k0 + b_r) * N + col0 + b_c];
+        }
+        Bs4[(b_r * BN + b_c) / 4] = bv;
+        __syncthreads();
+        for (int k = 0; k < BK; k++) {
+            // this thread's 8 values of A and 8 of B for this k, 4 at a time
+            for (int i = 0; i < TM; i += 4) {
+                float4 v = As4[(k * BM + trow * TM + i) / 4];
+                a[i] = v.x, a[i + 1] = v.y, a[i + 2] = v.z, a[i + 3] = v.w;
+            }
+            for (int j = 0; j < TN; j += 4) {
+                float4 v = Bs4[(k * BN + tcol * TN + j) / 4];
+                b[j] = v.x, b[j + 1] = v.y, b[j + 2] = v.z, b[j + 3] = v.w;
+            }
+            for (int i = 0; i < TM; i++) {
+                for (int j = 0; j < TN; j++) {
+                    acc[i][j] += a[i] * b[j];
+                }
+            }
+        }
+        __syncthreads();
+    }
+    // 4 values of a row at a time. a row's 8 start at a multiple of 4 and N is one, so a
+    // group of 4 is all in or all out
+    for (int i = 0; i < TM; i++) {
+        int r = row0 + trow * TM + i;
+        for (int j = 0; j < TN; j += 4) {
+            int c = col0 + tcol * TN + j;
+            if (r < M && c < N) {
+                *(float4 *)&C[(size_t)r * N + c] = make_float4(acc[i][j], acc[i][j + 1], acc[i][j + 2], acc[i][j + 3]);
+            }
+        }
+    }
+}
+
 // ---- launches ----
 
 cublasHandle_t g_cublas;
@@ -181,6 +250,15 @@ void launch_2d(const float *A, const float *B, float *C, int M, int N, int K) {
     matmul_2d<BM, BN, BK, TM, TN><<<grid, (BM / TM) * (BN / TN)>>>(A, B, C, M, N, K);
 }
 
+void launch_vec(const float *A, const float *B, float *C, int M, int N, int K) {
+    if (K % 4 != 0 || N % 4 != 0) {
+        launch_2d(A, B, C, M, N, K);
+        return;
+    }
+    dim3 grid((N + 127) / 128, (M + 127) / 128);
+    matmul_2d_vec<<<grid, 256>>>(A, B, C, M, N, K);
+}
+
 // cuBLAS stores matrices column by column. a row-major (M, N) matrix is the same bytes as
 // a column-major (N, M) one, its transpose, so ask cuBLAS for C^T = B^T @ A^T
 void launch_cublas(const float *A, const float *B, float *C, int M, int N, int K) {
@@ -189,9 +267,9 @@ void launch_cublas(const float *A, const float *B, float *C, int M, int N, int K
 }
 
 typedef void (*Matmul)(const float *, const float *, float *, int, int, int);
-const int KERNELS = 4;
-const char *NAMES[] = {"tiled", "1d", "2d", "cublas"};
-const Matmul MATMULS[] = {launch_tiled, launch_1d, launch_2d, launch_cublas};
+const int KERNELS = 5;
+const char *NAMES[] = {"tiled", "1d", "2d", "2d vec", "cublas"};
+const Matmul MATMULS[] = {launch_tiled, launch_1d, launch_2d, launch_vec, launch_cublas};
 
 template <typename F>
 float time_ms(F launch) {
@@ -343,7 +421,11 @@ int main() {
     bool small_ok = true;
     int shapes[][3] = {{1, 1, 1}, {1, 1, 100}, {7, 5, 3}, {31, 33, 1}, {33, 31, 64}, {32, 32, 32},
                        {100, 1, 50}, {1, 100, 50}, {257, 129, 65}, {1000, 777, 513},
-                       {64, 64, 8}, {65, 63, 9}, {128, 128, 7}, {129, 127, 17}, {200, 300, 8}};
+                       {64, 64, 8}, {65, 63, 9}, {128, 128, 7}, {129, 127, 17}, {200, 300, 8},
+                       // K and N multiples of 4, for the float4 kernel, with M, N and K
+                       // that don't fill a block or a step of 8
+                       {1, 4, 4}, {3, 4, 12}, {129, 132, 20}, {257, 260, 1028}, {130, 4, 4},
+                       {128, 128, 8}, {200, 300, 12}, {1000, 780, 516}};
     for (auto &s : shapes) {
         small_ok = run_shape(s[0], s[1], s[2], d, rng, false) && small_ok;
     }
