@@ -473,6 +473,24 @@ The graph saves 1% with the blocked matmuls and costs 5% with cuBLAS. The CPU wa
 
 The parts add up to a bit more than a real step (90 and 68 µs), since each was timed alone. A kernel that does almost nothing still takes 2 to 4 µs on the GPU itself: the relu on 8192 values takes 1.7, and the 4 memsets and one small kernel take 11.4. So at this size the step is set by how many kernels it has, which a graph doesn't change. Doing more in each kernel would: relu inside the first layer's matmul, the loss and its backward in one kernel, and gradients that the first write overwrites instead of adding to zeroed memory.
 
+### MNIST: a fused training step
+
+The breakdown above showed that at batch 64 the step is set by how many kernels it has, so `mnist/train_mlp.cu` now has a fused step with the blocked matmuls:
+
+- The matmul's epilogue takes two more options. It can apply relu, so the first layer writes `h` directly with no `h_pre` and no relu kernel. It can also set a value to 0 wherever a mask is `<= 0`, which is relu's backward: relu's slope can be read from its output, since `h > 0` exactly where `h_pre > 0`.
+- One kernel goes from the logits straight to `dlogits = (softmax - one_hot) / B`. Training doesn't look at the loss every step, so the per-row losses and their mean are skipped.
+- Every gradient is written instead of added into memory zeroed first, so the 4 memsets go.
+
+At batch 64 that's 14 GPU operations a step instead of 22, counting the memsets and the second kernel of each matmul that splits `K`. Each value is worked out the same way as before, so the program checks that the fused step gives exactly the same test loss as the unfused one. The first try didn't: 4 of the 640 values of `dlogits` in the first batch came out one bit apart, and 10 epochs later the test loss was 0.0789 instead of 0.0813. The compiler had fused the multiply in `p = exp(x - m) / d` with the subtraction of the one-hot in one kernel and not in the other, and a fused multiply-add rounds once instead of twice. Both kernels now round each step on its own with `__fmul_rn`, `__fsub_rn` and `__fadd_rn`, and the runs match to the bit.
+
+| Matmuls | Plain launches | CUDA graph |
+|---|---|---|
+| blocked | 86.4 ms per epoch | 84.4 ms |
+| blocked, fused step | 67.8 ms | 66.7 ms |
+| cuBLAS | 64.6 ms | 66.2 ms |
+
+(epoch 10 of each run.) The fused step is 22% faster and within 5% of cuBLAS with the unfused step, all with the kernels in this repo. Test accuracy after 10 epochs is 97.75%, the same as the unfused blocked runs.
+
 ## References
 
 - [How to Optimize a CUDA Matmul Kernel for cuBLAS-like Performance](https://siboehm.com/articles/22/CUDA-MMM), Simon Boehm
