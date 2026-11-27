@@ -182,6 +182,29 @@ GB/s counts 8 bytes a value for the forward and 12 for the backward, which also 
 
 I put 13 deliberate bugs into copies of the file and 12 fail the test. The one that passes removes the `__syncthreads` before the block scan writes its per-warp totals, so a warp can overwrite a total another warp is still reading from the previous call. That is a race, and it didn't show up on this GPU.
 
+### Attention, naive
+
+`kernels/attention.cu` is macrograd's `scaled_dot_product_attention` forward, `softmax(q @ k^T / sqrt(d) + mask) @ v`, for `BH` heads at once. With `causal`, query `i` sees keys up to `T_k - T_q + i`, as macrograd does when there are fewer queries than keys. It runs in three steps that each go through memory: the score matrix `S = q @ k^T` for each head with the linear layer's matmul (reading `k` transposed in place), one kernel that scales, masks and takes the softmax of each row of `S`, and `P @ v` for each head. The same three steps with `cublasSgemmStridedBatched`, all heads in one call, are there to compare against.
+
+- Against macrograd on 4 heads with 5 queries and 7 keys, with and without the mask: within 6.9e-8.
+- 8 shapes against a CPU version in double, from 1 query and 1 key to 300 queries, 1000 keys and heads of 128, with and without the mask: largest error 7.5e-7, relative to `sum_j p_j |v_j|`.
+- A row where every key past the mask scores far higher than the visible ones, up to 200 against 0. The softmax's max has to leave the masked scores out, and be taken after scaling. Otherwise every `exp` in the row underflows to 0 and the row is 0 / 0. Two deliberate bugs that did exactly this passed the other tests, since softmax gives the same answer for any shift as long as nothing underflows.
+
+16 heads of size 64 with the causal mask. GFLOPS counts the two matmuls, `4 T^2 d` per head, including the masked half:
+
+| T | Naive | cuBLAS matmuls | Score matrix | Softmax alone |
+|---|---|---|---|---|
+| 256 | 0.633 ms, 424 GFLOPS | 0.140 ms, 1915 | 4.2 MB | 0.056 ms |
+| 1024 | 3.158 ms, 1360 | 1.309 ms, 3281 | 67 MB | 0.335 ms |
+| 2048 | 11.85 ms, 1450 | 4.457 ms, 3855 | 268 MB | 1.20 ms |
+| 4096 | 43.32 ms, 1586 | 20.69 ms, 3322 | 1074 MB | 6.25 ms |
+
+- The score matrix grows with `T^2`: a GB at 4096 for 16 heads, which is written by the first matmul, read and written by the softmax, and read again by the second.
+- The softmax alone is 30% of the cuBLAS version's time at 4096. The rest is the matmuls, and cuBLAS does them at 3.3 to 3.9 TFLOPS, well below its 10 for square matrices: one of the two products has an inner dimension of only 64.
+- The naive version launches 2 matmuls per head, and its kernel isn't tuned for an inner dimension of 64 either, so it's 2.1 to 4.5 times slower than cuBLAS.
+
+I put 8 deliberate bugs into copies of the file. Five failed the first tests, and the two above failed once the large-score test was added. The one that passes removes a `__syncthreads` in the block sum, a race that didn't show up on this GPU.
+
 ### Matmul: naive
 
 `C = A @ B` for square matrices, one thread per value of `C`, blocks of 32 x 32 threads. GFLOPS counts a multiply and an add for each of the `n^3` terms. Inputs are uniform in [-1, 1]. The error is `|gpu - ref| / sum_k |A[i][k] B[k][j]|` against a CPU matmul in double precision, over every value up to 1024 x 1024 and over 4100 sampled values above that. The last column is the time of `cublasSgemm` divided by the kernel's time.
