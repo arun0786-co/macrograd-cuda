@@ -281,6 +281,35 @@ I put 13 deliberate bugs into copies of the file and 12 fail the test. The one t
 
 I put 8 deliberate bugs into copies of the file. Five failed the first tests, and the two above failed once the large-score test was added. The one that passes removes a `__syncthreads` in the block sum, a race that didn't show up on this GPU.
 
+### Attention backward
+
+`kernels/attention_backward.cu` gives the gradients of `out = P @ v`, `P = softmax(q @ k^T / sqrt(d) + mask)`, added into `dq`, `dk` and `dv`:
+
+```
+dv = P^T @ dO
+dP = dO @ v^T
+dS = P * (dP - rowsum(dP * P)) / sqrt(d)
+dq = dS @ k,   dk = dS^T @ q
+```
+
+It's the naive version: it makes `P` again with the naive forward, keeps `dP` as a second score matrix, and runs the four products with the linear layer's matmul, which reads the transposes in place. Masked scores have `P = 0`, so they get `dS = 0` and pass nothing back.
+
+- The formulas against finite differences of the forward, in double, with and without the mask: within 1.9e-10.
+- Against macrograd's backward, causal with 5 queries and 7 keys: within 9.0e-8.
+- 7 shapes with and without the mask against a CPU version in double, with gradients that start at random values: largest error 9.0e-7, relative to the size of what went into each value.
+
+16 heads of 64, causal:
+
+| T | Forward | Backward (forward included) |
+|---|---|---|
+| 256 | 0.641 ms | 1.853 ms |
+| 1024 | 3.153 ms | 8.867 ms |
+| 2048 | 12.21 ms | 34.27 ms |
+
+The backward takes 2.8 to 2.9 times the forward. It does the forward's two products again plus four of the same size, and two passes over a score matrix instead of one.
+
+All 8 deliberate bugs I put into copies of the file fail the test.
+
 ### Attention, fused
 
 `kernels/attention_fused.cu` gives the same result as the naive version in one kernel that never writes the score matrix to memory, the idea behind flash attention (Dao et al., 2022). A block takes 64 queries of one head, one thread per query, and keeps the query row and the output row in registers. It walks the keys a tile at a time: the block loads the tile's keys and values into shared memory, each thread works out its scores and their max, scales its output row and running sum by `exp(m_old - m_new)` when the max goes up, and adds `exp(s - m) * v` for the tile. At the end it divides by the sum. With the causal mask, tiles past every query of the block are skipped. Head sizes are 16, 32, 64 and 128, with `d = d_v`.
