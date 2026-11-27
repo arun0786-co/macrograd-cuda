@@ -136,6 +136,29 @@ __global__ void count_correct(const float *logits, const int *labels, int *corre
 
 int blocks(size_t n) { return (int)((n + THREADS - 1) / THREADS); }
 
+// the loss's backward without the loss: training doesn't look at the loss every step, so
+// the fused step skips the per-row losses and their mean, and goes straight from the
+// logits to dlogits = (softmax - one_hot) / B. one thread per row, the same arithmetic as
+// the thread-per-row kernels in cross_entropy.cu, so the result is the same to the bit
+__global__ void softmax_minus_onehot(const float *logits, const int *labels, float *dlogits, int B) {
+    int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r < B) {
+        const float *x = logits + r * CLASSES;
+        float m = -INFINITY;
+        for (int c = 0; c < CLASSES; c++) m = fmaxf(m, x[c]);
+        float d = 0.0f;
+        for (int c = 0; c < CLASSES; c++) d += expf(x[c] - m);
+        // rounded step by step with the _rn intrinsics, as in cross_entropy.cu's backward:
+        // left to itself the compiler fused p's multiply with the subtraction here but not
+        // there, and 4 of the 640 values of the first batch came out one bit apart
+        float inv_d = 1.0f / d, scale = 1.0f / B;
+        for (int c = 0; c < CLASSES; c++) {
+            float p = __fmul_rn(expf(x[c] - m), inv_d);
+            dlogits[r * CLASSES + c] = __fmul_rn(scale, __fsub_rn(p, c == labels[r] ? 1.0f : 0.0f));
+        }
+    }
+}
+
 // ---- the model ----
 
 const size_t W1 = 0, B1 = W1 + (size_t)IN * HIDDEN, W2 = B1 + HIDDEN, B2 = W2 + (size_t)HIDDEN * CLASSES,
@@ -147,7 +170,7 @@ struct Net {
     float *xb, *h_pre, *h, *logits, *dlogits, *dh, *dh_pre, *row_loss, *loss, *dloss;
     float2 *stats;
     int *yb, *idx, *correct, *step_number;
-    bool cublas;
+    bool cublas, fused = false;
 
     void forward(int B) {
         if (cublas) {
@@ -178,10 +201,38 @@ struct Net {
         backward_layer(xb, params + W1, dh_pre, nullptr, grads + W1, grads + B1, B, IN, HIDDEN);
     }
 
+    // the same step in fewer kernels, with the blocked matmuls only:
+    // - relu inside the first layer's matmul, so h is written once and h_pre not at all
+    // - relu's backward inside the matmul that makes dh: zero where h <= 0. relu's slope
+    //   can be read from its output, h > 0 exactly where h_pre > 0
+    // - the loss's backward without the loss (softmax_minus_onehot)
+    // - every gradient written instead of added to memory zeroed first, so no memsets
+    // each value is worked out with the same operations in the same order as in forward()
+    // and backward(): adding to 0 and multiplying by a slope of 1 change nothing, so the
+    // weights come out the same to the bit
+    void forward_backward_fused(int B) {
+        lin::matmul<false, false>(xb, params + W1, h, params + B1, false, B, HIDDEN, IN, lin::AUTO, {true, nullptr});
+        lin::linear_forward(h, params + W2, params + B2, logits, B, HIDDEN, CLASSES);
+        softmax_minus_onehot<<<blocks(B), THREADS>>>(logits, yb, dlogits, B);
+        lin::matmul<false, true>(dlogits, params + W2, dh_pre, nullptr, false, B, HIDDEN, CLASSES, lin::AUTO, {false, h});
+        lin::matmul<true, false>(h, dlogits, grads + W2, nullptr, false, HIDDEN, CLASSES, B);
+        lin::launch_column_sum(dlogits, grads + B2, B, CLASSES, false);
+        lin::matmul<true, false>(xb, dh_pre, grads + W1, nullptr, false, IN, HIDDEN, B);
+        lin::launch_column_sum(dh_pre, grads + B1, B, HIDDEN, false);
+    }
+
+    void forward_backward(int B) {
+        if (fused) {
+            forward_backward_fused(B);
+        } else {
+            forward(B);
+            backward(B);
+        }
+    }
+
     void step(const float *images, const int *labels, const int *batch_idx, int B, opt::SGD &sgd) {
         gather<<<blocks((size_t)B * IN), THREADS>>>(images, labels, batch_idx, xb, yb, B);
-        forward(B);
-        backward(B);
+        forward_backward(B);
         sgd.step(params, grads, vel, PARAMS);
     }
 
@@ -191,8 +242,7 @@ struct Net {
         cudaGraphExec_t exec;
         CUDA_CHECK(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeGlobal));
         gather_step<<<blocks((size_t)BATCH * IN), THREADS>>>(images, labels, idx, step_number, xb, yb, BATCH);
-        forward(BATCH);
-        backward(BATCH);
+        forward_backward(BATCH);
         sgd.step(params, grads, vel, PARAMS);
         next_step<<<1, 1>>>(step_number);
         CUDA_CHECK(cudaStreamEndCapture(cudaStreamPerThread, &graph));
@@ -334,8 +384,10 @@ bool check(Net &net, const DeviceSplit &train) {
 
 // returns the test loss after the last epoch, so the runs with and without a graph can
 // be compared
-double train_once(Net &net, const DeviceSplit &trainset, const DeviceSplit &testset, bool cublas, bool graph) {
+double train_once(Net &net, const DeviceSplit &trainset, const DeviceSplit &testset, bool cublas, bool graph,
+                  bool fused) {
     net.cublas = cublas;
+    net.fused = fused;
     std::mt19937 rng(0);
     opt::SGD sgd{LR, MOMENTUM, 0.0f};
     std::vector<int> order(trainset.n);
@@ -351,8 +403,8 @@ double train_once(Net &net, const DeviceSplit &trainset, const DeviceSplit &test
     if (graph) {
         exec = net.record_step(trainset.images, trainset.labels, sgd);
     }
-    printf("\n%s matmuls, %s, batch %d, SGD lr %.2f momentum %.1f\n", cublas ? "cuBLAS" : "blocked",
-           graph ? "CUDA graph" : "plain launches", BATCH, LR, MOMENTUM);
+    printf("\n%s matmuls, %s%s, batch %d, SGD lr %.2f momentum %.1f\n", cublas ? "cuBLAS" : "blocked",
+           graph ? "CUDA graph" : "plain launches", fused ? ", fused" : "", BATCH, LR, MOMENTUM);
     cudaEvent_t start, stop;
     CUDA_CHECK(cudaEventCreate(&start));
     CUDA_CHECK(cudaEventCreate(&stop));
@@ -445,18 +497,24 @@ void breakdown(Net &net, const DeviceSplit &trainset) {
     }
 }
 
-// the graph replays the same kernels in the same order, so it has to give exactly the
-// same weights, and so the same test loss to the last bit
+// the graph replays the same kernels in the same order, and the fused step does the same
+// arithmetic, so with the blocked matmuls all four runs have to give exactly the same
+// weights, and so the same test loss to the last bit. with cuBLAS, the two runs too
 bool train(Net &net, const DeviceSplit &trainset, const DeviceSplit &testset) {
-    bool ok = true;
-    for (bool cublas : {false, true}) {
-        double plain = train_once(net, trainset, testset, cublas, false);
-        double graphed = train_once(net, trainset, testset, cublas, true);
-        bool same = plain == graphed;
-        printf("same test loss with and without the graph: %s\n", same ? "yes" : "NO");
-        ok = ok && same;
+    double blocked[4], cublas[2];
+    int n = 0;
+    for (bool fused : {false, true}) {
+        for (bool graph : {false, true}) {
+            blocked[n++] = train_once(net, trainset, testset, false, graph, fused);
+        }
     }
-    return ok;
+    cublas[0] = train_once(net, trainset, testset, true, false, false);
+    cublas[1] = train_once(net, trainset, testset, true, true, false);
+    bool same = blocked[1] == blocked[0] && blocked[2] == blocked[0] && blocked[3] == blocked[0];
+    printf("\nblocked: same test loss with and without the graph and the fusing: %s\n", same ? "yes" : "NO");
+    bool same_cublas = cublas[0] == cublas[1];
+    printf("cuBLAS: same test loss with and without the graph: %s\n", same_cublas ? "yes" : "NO");
+    return same && same_cublas;
 }
 
 int main(int argc, char **argv) {
