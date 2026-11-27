@@ -187,6 +187,9 @@ bool check(const char *name, double (*f)(double), double (*slope)(double),
     return ok;
 }
 
+// the test. a program that includes this file for its kernels defines
+// MACROGRAD_NO_MAIN first, like mnist/train_mlp.cu
+#ifndef MACROGRAD_NO_MAIN
 int main() {
     // not a multiple of the block size, so the i < n check gets used
     int n = (1 << 24) + 7;
@@ -251,3 +254,4 @@ int main() {
     CUDA_CHECK(cudaFree(d_dx));
     return ok ? 0 : 1;
 }
+#endif

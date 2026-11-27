@@ -25,13 +25,13 @@ Forward and backward written by hand for each layer, no autograd.
 - [x] linear layer forward and backward
 - [x] cross entropy forward and backward
 - [x] SGD and Adam update kernels
-- [ ] full training loop on the GPU, matching macrograd's loss on a small model with the same weights
+- [x] full training loop on the GPU, matching macrograd's loss on a small model with the same weights
 
 ### 3. Results
 
 - [ ] GFLOPS for each matmul version vs cuBLAS at a few sizes
 - [ ] Nsight Compute numbers that explain each speedup (memory throughput, occupancy)
-- [ ] MNIST time per epoch and test accuracy
+- [x] MNIST time per epoch and test accuracy
 
 ## Layout
 
@@ -239,6 +239,23 @@ The test checks the backward formula against finite differences of the CPU loss 
 SGD moves 20 bytes per weight (reads the weight, gradient and velocity, writes the weight and velocity) and AdamW 28. `cudaMemcpy` does 357 GB/s. At 2^24 weights the steps run at 97% and 92% of copy speed, so there is little left to gain. The MNIST-sized steps go faster than memory allows because the 2 to 3 MB they touch stays in the 2.75 MB L2 cache between repeats. In a training loop the forward and backward run in between and push it out.
 
 I put 16 deliberate bugs into copies of the file and 15 fail the test. The one that passes reads `m[i]` back right after writing it, which gives the same number. Two bugs that update one weight past the end passed at first: the memory there was NaN, and an update of NaN writes NaN back. The test now fills the space after the end with 3.0 instead.
+
+### Training an MLP on MNIST
+
+`mnist/train_mlp.cu` trains `linear(784, 128) -> relu -> linear(128, 10) -> cross entropy` on MNIST with the kernels above, all on the GPU. The backward is written out layer by layer, and one SGD launch updates all 101,770 weights, since they sit in one buffer. The images go to the GPU once, and each step gathers its batch there. The kernel files are included whole, each in its own namespace, with `MACROGRAD_NO_MAIN` so their tests are left out, so each file still builds and tests on its own. `python3 mnist/get_mnist.py` downloads the data into `data/` first.
+
+`./build/train_mlp --check` runs the first 20 steps against macrograd: the same model, weights made from a hash of their index (whole numbers times 2^-24 or 2^-22, exact in float and double), batches of 32 in file order, and SGD with lr 0.1 and momentum 0.9 (`tests/make_mnist_fixture.py`). The losses go from 2.2886341 to 1.0357997 on the GPU and to 1.0357998 in macrograd, and the largest difference over the 20 steps is 2.1e-7 with the blocked matmul and 2.3e-7 with cuBLAS.
+
+The full run trains 10 epochs from macrograd's init (uniform in `+-1 / sqrt(inputs)`, biases 0), batch 64, SGD with lr 0.05 and momentum 0.9, once with the blocked matmul and once with cuBLAS from the same starting weights and the same shuffles:
+
+| Matmuls | Time per epoch | Time per step | Test accuracy after 1 / 5 / 10 epochs | Test loss after 10 |
+|---|---|---|---|---|
+| blocked | 402 ms | 429 µs | 95.73% / 97.38% / 97.67% | 0.084 |
+| cuBLAS | 64 ms | 68 µs | 95.80% / 97.54% / 97.91% | 0.079 |
+
+- The two runs drift apart from the first epoch, though they start from the same weights and see the same batches: the sums inside the matmuls are added in a different order, and training makes the small differences grow. Both reach about 97.8%, and 99.7% on the training set, so the model is overfitting by epoch 10.
+- The blocked version is 6 times slower, and it's the matmuls. A batch of 64 gives the first layer's forward a single 128 x 128 block, which walks all 784 inputs alone, and its weight gradient 7 blocks, so most of the 28 SMs sit idle (see the linear layer above). cuBLAS picks kernels for shapes like these.
+- macrograd takes about 0.7 seconds for one step of 32 images, so an epoch there is about 20 minutes. The GPU does a step of 64 in 68 µs with cuBLAS.
 
 ## References
 

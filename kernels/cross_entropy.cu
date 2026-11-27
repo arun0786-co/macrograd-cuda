@@ -399,6 +399,9 @@ double check_formula(std::mt19937 &rng) {
     return worst;
 }
 
+// the test. a program that includes this file for its kernels defines
+// MACROGRAD_NO_MAIN first, like mnist/train_mlp.cu
+#ifndef MACROGRAD_NO_MAIN
 int main() {
     Device d;
     CUDA_CHECK(cudaMalloc(&d.x, CAP * sizeof(float)));
@@ -465,3 +468,4 @@ int main() {
     printf("\n%s\n", ok ? "all ok" : "SOMETHING IS WRONG");
     return ok ? 0 : 1;
 }
+#endif
