@@ -29,8 +29,8 @@ Forward and backward written by hand for each layer, no autograd.
 
 ### 3. Results
 
-- [ ] GFLOPS for each matmul version vs cuBLAS at a few sizes
-- [ ] Nsight Compute numbers that explain each speedup (memory throughput, occupancy)
+- [x] GFLOPS for each matmul version vs cuBLAS at a few sizes
+- [ ] Nsight Compute numbers that explain each speedup (memory throughput, occupancy). The cluster GPU doesn't allow the performance counters, so for now there are the compiler's and the occupancy calculator's numbers instead
 - [x] MNIST time per epoch and test accuracy
 
 ## Layout
@@ -172,6 +172,27 @@ The largest error was 2.9e-7 over the square sizes. The three runs agree within 
 - It is still at 37% of cuBLAS.
 
 The test also checks that nothing is written up to 128 rows past the end of `C`. I added that after a bug that removed the 2d kernel's row check passed. I put 17 deliberate bugs into copies of the file and 14 fail the test. Two of the three that pass remove a bounds check on the rows of `A` or the columns of `B`. Those values only go into values of `C` outside the matrix, which are never written, though the kernel does read past the end of `A` or into the next row of `B`. The third removes the last `__syncthreads` of the 2d loop, so a thread can load the next tile while another still reads this one. That is a race, but it didn't show up in these runs on this GPU.
+
+### Matmul: what each kernel asks of the GPU
+
+Nsight Compute needs the GPU's performance counters, and the cluster only lets admins read them (`ERR_NVGPUCTRPERM`). `bench/matmul_resources.cu` gets what it can without them: each kernel's registers, shared memory and spills from the compiler, how many blocks fit on an SM from the occupancy calculator, its time at 4096, and from its design, how many floats it must read from global memory. The GPU has 28 SMs, 64 warps, 65,536 registers and 96 KB of shared memory per SM, 11.3 TFLOPS at 1.58 GHz and 484 GB/s.
+
+| Kernel | Threads per block | Registers per thread | Shared memory per block | Blocks per SM | Occupancy | ms at 4096 | % of peak FLOPS | Global reads | Global reads per second |
+|---|---|---|---|---|---|---|---|---|---|
+| naive rows | 1024 | 32 | 0 | 2 | 100% | 2617.6 | 0.5% | 549.8 GB | 210 GB/s |
+| naive cols | 1024 | 32 | 0 | 2 | 100% | 297.8 | 4.1% | 549.8 GB | 1846 GB/s |
+| tiled 16 | 256 | 27 | 2 KB | 8 | 100% | 98.8 | 12.3% | 34.4 GB | 348 GB/s |
+| tiled 32 | 1024 | 28 | 8 KB | 2 | 100% | 83.6 | 14.5% | 17.2 GB | 206 GB/s |
+| 1d, 64 x 64 blocks, 8 per thread | 512 | 64 | 4 KB | 2 | 50% | 54.3 | 22.3% | 8.6 GB | 158 GB/s |
+| 2d, 128 x 128 blocks, 8 x 8 per thread | 256 | 120 | 8 KB | 2 | 25% | 38.1 | 31.8% | 4.3 GB | 113 GB/s |
+| `cublasSgemm` | | | | | | 15.0 | 80.6% | | |
+
+None of them spill registers. "Global reads" is what the design asks for: 2 floats per multiply-add for the naive kernels, `2 / T` for tiles of `T`, and `1 / BM + 1 / BN` for blocks of `BM x BN`. It isn't what reaches DRAM, which only a counter could tell.
+
+- The naive cols kernel asks for 1846 GB/s, almost 4 times what DRAM can give, so the caches serve most of its reads. A warp's 32 threads share one row of `A`, so they all read the same float of it, and their 32 floats of `B` sit next to each other in memory. The rows kernel asks for the same bytes at a ninth of the speed, because its warps read 32 floats a whole row apart.
+- Tiled 16 needs 348 GB/s, 72% of DRAM, so it's close to memory bound. Tiled 32 halves the bytes but is only 18% faster, which points at something else: both read 2 floats from shared memory for every multiply-add.
+- Register blocking cuts the shared memory loads per multiply-add from 2 to 1.125 (1d) and 0.25 (2d), and the time falls with them, while occupancy falls from 100% to 50% and 25%. A 2d thread keeps 64 values of `C` plus 16 of `A` and `B` in its 120 registers, so only 512 threads fit on an SM. Few warps are enough when each one has 64 independent multiply-adds per step to keep the cores busy, so occupancy isn't what limits these kernels.
+- cuBLAS is 2.5 times faster than the 2d kernel. The usual next steps (Boehm's article) are vectorized 128-bit loads, storing the `A` tile transposed so a thread reads its 8 values in one go, and double buffering the tiles. The counters would show which of these matters on this GPU.
 
 ### Linear layer
 
