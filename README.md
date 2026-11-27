@@ -198,6 +198,18 @@ Both match macrograd (with ids repeated up to 4 times) within 8.4e-8, and a CPU 
 
 I put 9 deliberate bugs into copies of the file and all fail the test. One passed at first: without the check that stops blocks past the number of distinct ids, those blocks read runs left over from an earlier call, and the scratch memory happened to hold zeros, which add nothing. The test now plants a fake run of length 1 there before each call.
 
+### Dropout
+
+`kernels/dropout.cu` is macrograd's `dropout`: each value is kept with probability `1 - p` and scaled by `1 / (1 - p)`, or set to 0, and its backward applies the same mask to `dy`. The random numbers come from Philox-4x32-10 (Salmon et al., 2011), a counter-based generator. Four 32-bit outputs are a fixed scrambling of a 128-bit counter and a 64-bit key, with no state carried from one number to the next. So value `i` of the mask is `philox(counter = i / 4, key = seed)[i % 4]`, which any thread can work out on its own, and the backward makes the mask again from the seed instead of storing it. As in macrograd, a value is kept when `u > p`, with `u` the top 24 bits over 2^24. `p = 1` drops everything, which macrograd doesn't allow.
+
+- The three `philox4x32 10` known-answer vectors in Random123's `tests/kat_vectors` (the reference implementation) all match. I first wrote the third from memory and two of its words were wrong. The test failed, and the published file settled it.
+- The same Philox function runs on the CPU, so the GPU's forward and backward have to match the CPU's bit for bit, on 1 to 2^20 values with `p` from 0 to 1. They do.
+- On 2^24 values the kept fraction is within 1.2 standard deviations of `1 - p` for `p` = 0.1, 0.5 and 0.9, and masks from seeds 1 and 2 agree on 49.95% of values at `p = 0.5`, as unrelated masks should.
+
+On 2^24 values the forward takes 0.488 ms (275 GB/s at 8 bytes a value) and the backward 0.590 ms (341 GB/s at 12), against 359 GB/s for `cudaMemcpy`. Each thread does 4 values with one Philox call of 10 rounds, and the forward is the one that runs short of copy speed, so the random numbers cost something there.
+
+I put 8 deliberate bugs into copies of the file and 7 fail the test. The one that passes keeps values with `u >= p` instead of `u > p`, which only differs when `u` equals `p` exactly: a chance of 2^-24 per value at `p = 0.5`.
+
 ### Prefix sum (cumsum)
 
 `kernels/cumsum.cu` is macrograd's `cumsum` along the last axis, `out[k] = x[0] + ... + x[k]` on each row, and its backward, the same scan run from the end of the row and added into `dx`. Each thread scans 4 values of its own, the threads' totals are scanned across the block (5 `__shfl_up_sync` steps in each warp, then the same on the warps' totals), and each thread adds the total of everything before it. Two ways to lay it out:
