@@ -230,6 +230,31 @@ It matches the CPU version on 9 shapes for every head size, with and without the
 
 I put 12 deliberate bugs into copies of the file and 9 fail the test. Two of the three that pass remove checks that can't be hit: the guard for a tile with no key the query may see (a query always sees key 0, so its first tile always has one), and the check for keys past the end (the mask already stops before it). The third removes the `__syncthreads` after loading a tile, a race that didn't show up with 2 warps per block.
 
+### Attention, fused and register blocked
+
+A second fused kernel in `kernels/attention_fused.cu` does the two products the way the 2d blocked matmul does. 128 threads take 64 queries, with key tiles of 32. Each thread works out a 4 x 4 square of scores and owns the same 4 query rows of the output, `4 x d/8` values. So the 8 threads that share 4 rows sit next to each other in a warp, and combine their row max and sum with 3 shuffles. For the scores a thread reads 8 floats from shared memory for 16 multiply-adds, and for the output `4 + d/8` floats for `4 x d/8`. The thread-per-query kernel did 1 for 1. `q` is stored transposed in shared memory, so a warp's reads of its 4 row groups land in different banks. At `d = 128` the tiles don't fit in 48 KB of shared memory, so that size keeps using the thread-per-query kernel.
+
+Both fused kernels are checked on the same shapes, with `NaN` in the memory after `q`, `k` and `v`. One deliberate bug, loading keys past the end without a bounds check, passed until that was added. Those keys get weight 0, and `0 * x` is 0 for any `x` except `NaN`.
+
+16 heads, causal (ms):
+
+| d | T | Naive | cuBLAS matmuls | Fused, thread per query | Fused, blocked |
+|---|---|---|---|---|---|
+| 32 | 256 | 0.480 | 0.133 | 0.208 | 0.077 |
+| 32 | 1024 | 2.580 | 1.289 | 1.841 | 0.504 |
+| 32 | 2048 | 11.02 | 4.306 | 5.329 | 1.481 |
+| 32 | 4096 | 40.62 | 20.21 | 19.85 | 5.454 |
+| 64 | 256 | 0.509 | 0.117 | 0.254 | 0.104 |
+| 64 | 1024 | 2.589 | 1.241 | 2.095 | 0.822 |
+| 64 | 2048 | 12.02 | 4.449 | 6.891 | 2.859 |
+| 64 | 4096 | 46.49 | 20.75 | 24.93 | 10.65 |
+
+- The blocked kernel is the fastest at every size here. At `T = 4096` it's 3.7 times faster than the cuBLAS version at `d = 32` and 1.9 times at `d = 64`, and it still stores nothing but the output.
+- Against the thread-per-query kernel it's 2.3 to 3.6 times faster. It uses 89 and 105 registers per thread instead of 127 and 210, and 2 or 3 blocks of 128 threads fit on an SM, 8 or 12 warps, instead of 4 to 6.
+- Part of the gain over cuBLAS is skipping the masked half, which cuBLAS computes and the softmax then throws away.
+
+I put 12 deliberate bugs into the blocked kernel and 8 fail the test. Two of the four that pass remove guards for query rows past the end, which are worked out but never stored. The other two remove a `__syncthreads`, races that didn't show up on this GPU.
+
 ### Matmul: naive
 
 `C = A @ B` for square matrices, one thread per value of `C`, blocks of 32 x 32 threads. GFLOPS counts a multiply and an add for each of the `n^3` terms. Inputs are uniform in [-1, 1]. The error is `|gpu - ref| / sum_k |A[i][k] B[k][j]|` against a CPU matmul in double precision, over every value up to 1024 x 1024 and over 4100 sampled values above that. The last column is the time of `cublasSgemm` divided by the kernel's time.
