@@ -202,13 +202,36 @@ I put 9 deliberate bugs into copies of the file and all fail the test. One passe
 
 `kernels/dropout.cu` is macrograd's `dropout`: each value is kept with probability `1 - p` and scaled by `1 / (1 - p)`, or set to 0, and its backward applies the same mask to `dy`. The random numbers come from Philox-4x32-10 (Salmon et al., 2011), a counter-based generator. Four 32-bit outputs are a fixed scrambling of a 128-bit counter and a 64-bit key, with no state carried from one number to the next. So value `i` of the mask is `philox(counter = i / 4, key = seed)[i % 4]`, which any thread can work out on its own, and the backward makes the mask again from the seed instead of storing it. As in macrograd, a value is kept when `u > p`, with `u` the top 24 bits over 2^24. `p = 1` drops everything, which macrograd doesn't allow.
 
-- The three `philox4x32 10` known-answer vectors in Random123's `tests/kat_vectors` (the reference implementation) all match. I first wrote the third from memory and two of its words were wrong. The test failed, and the published file settled it.
+- The three `philox4x32 10` known-answer vectors in Random123's `tests/kat_vectors` (the reference implementation) all match. I first wrote the third from memory and three of its four words were wrong. The test failed, and the published file settled it.
 - The same Philox function runs on the CPU, so the GPU's forward and backward have to match the CPU's bit for bit, on 1 to 2^20 values with `p` from 0 to 1. They do.
 - On 2^24 values the kept fraction is within 1.2 standard deviations of `1 - p` for `p` = 0.1, 0.5 and 0.9, and masks from seeds 1 and 2 agree on 49.95% of values at `p = 0.5`, as unrelated masks should.
 
 On 2^24 values the forward takes 0.488 ms (275 GB/s at 8 bytes a value) and the backward 0.590 ms (341 GB/s at 12), against 359 GB/s for `cudaMemcpy`. Each thread does 4 values with one Philox call of 10 rounds, and the forward is the one that runs short of copy speed, so the random numbers cost something there.
 
 I put 8 deliberate bugs into copies of the file and 7 fail the test. The one that passes keeps values with `u >= p` instead of `u > p`, which only differs when `u` equals `p` exactly: a chance of 2^-24 per value at `p = 0.5`.
+
+### Conv2d
+
+`kernels/conv2d.cu` is macrograd's `conv2d` forward: images `(N, C, H, W)`, filters `(O, C, KH, KW)`, stride and zero padding, no bias. It has two versions:
+
+1. Direct: one thread per output value, looping over the `C x KH x KW` taps. The threads of a warp share an image, a filter and an output row, so they read the same filter value at each step.
+2. im2col: write every patch of every image out as a column of a matrix with `C x KH x KW` rows and `N x OH x OW` columns, run one matmul (`w @ cols`, the linear layer's kernel), and move the result into `(N, O, OH, OW)` order. It runs at matmul speed, but `cols` holds each image value up to `KH x KW` times.
+
+Both match macrograd within 5.7e-7, with stride 1 and padding 1 and with stride 2 and no padding, and a CPU version in double within 2.4e-7 on 9 shapes. Those shapes include 1 x 1 filters, a filter as big as the image, a stride bigger than the filter and a padding of 2, with NaN after the end of the inputs.
+
+| N, C, H x W -> O, filter, padding | Direct | im2col | `cols` |
+|---|---|---|---|
+| 64, 1, 28 x 28 -> 32, 3 x 3, 1 | 0.241 ms, 120 GFLOPS | 0.405 ms, 71 GFLOPS | 1.8 MB |
+| 64, 32, 28 x 28 -> 64, 3 x 3, 1 | 6.701 ms, 276 | 2.814 ms, 657 | 58 MB |
+| 64, 64, 32 x 32 -> 64, 3 x 3, 1 | 13.75 ms, 352 | 6.171 ms, 783 | 151 MB |
+| 32, 128, 28 x 28 -> 128, 3 x 3, 1 | 20.88 ms, 354 | 4.533 ms, 1632 | 116 MB |
+| 64, 256, 14 x 14 -> 256, 1 x 1, 0 | 11.64 ms, 141 | 0.952 ms, 1726 | 13 MB |
+
+- im2col is 2.2 to 12 times faster from 32 channels up. The direct kernel does one multiply-add per filter value it loads, with no reuse in registers, and the matmul reuses each loaded value many times.
+- With one input channel (the first layer of an MNIST CNN) there are only 9 taps per output, the matmul's inner dimension is 9, and the direct kernel is faster.
+- The price is memory: 151 MB of `cols` for a 17 MB input at 64 x 64 x 32 x 32. Real libraries do the unfolding tile by tile inside the matmul ("implicit GEMM") so it never all exists at once.
+
+All 8 deliberate bugs I put into copies of the file fail the test.
 
 ### Prefix sum (cumsum)
 
