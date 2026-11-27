@@ -209,6 +209,9 @@ bool run_shape(int M, int N, int K, Buffers d, std::mt19937 &rng, bool timing) {
     return ok;
 }
 
+// the test. a program that includes this file for its kernels defines
+// MACROGRAD_NO_MAIN first, like bench/matmul_resources.cu
+#ifndef MACROGRAD_NO_MAIN
 int main() {
     const int max_dim = 4096;
     Buffers d;
@@ -247,3 +250,4 @@ int main() {
     printf("\n%s\n", ok ? "all ok" : "SOMETHING IS WRONG");
     return ok ? 0 : 1;
 }
+#endif
