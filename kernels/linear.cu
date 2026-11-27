@@ -163,11 +163,14 @@ void linear_forward(const float *x, const float *W, const float *b, float *y, in
     matmul<false, false>(x, W, y, b, false, R, O, I);
 }
 
-// dx += dy @ W^T, dW += x^T @ dy, db += column sums of dy
+// dx += dy @ W^T, dW += x^T @ dy, db += column sums of dy. dx can be null when the
+// input needs no gradient, like the images going into a first layer
 void linear_backward(const float *x, const float *W, const float *dy, float *dx, float *dW, float *db,
                      int R, int I, int O) {
     // dy is (R, O) and W^T is W (I, O) read as (O, I)
-    matmul<false, true>(dy, W, dx, nullptr, true, R, I, O);
+    if (dx) {
+        matmul<false, true>(dy, W, dx, nullptr, true, R, I, O);
+    }
     // x^T is x (R, I) read as (I, R), and dy is (R, O)
     matmul<true, false>(x, dy, dW, nullptr, true, I, O, R);
     launch_column_sum(dy, db, R, O);
@@ -196,7 +199,9 @@ void cublas_backward(const float *x, const float *W, const float *dy, float *dx,
                      int R, int I, int O) {
     const float one = 1.0f;
     // dx^T (I, R) += W (I, O) @ dy^T (O, R). the stored W is W^T in column-major, so transpose it
-    CUBLAS_CHECK(cublasSgemm(g_cublas, CUBLAS_OP_T, CUBLAS_OP_N, I, R, O, &one, W, O, dy, O, &one, dx, I));
+    if (dx) {
+        CUBLAS_CHECK(cublasSgemm(g_cublas, CUBLAS_OP_T, CUBLAS_OP_N, I, R, O, &one, W, O, dy, O, &one, dx, I));
+    }
     // dW^T (O, I) += dy^T (O, R) @ x (R, I). the stored x is x^T in column-major, so transpose it
     CUBLAS_CHECK(cublasSgemm(g_cublas, CUBLAS_OP_N, CUBLAS_OP_T, O, I, R, &one, dy, O, x, I, &one, dW, O));
     launch_column_sum(dy, db, R, O);
@@ -419,6 +424,9 @@ bool check_macrograd(const char *path, Buffers d) {
     return ok;
 }
 
+// the test. a program that includes this file for its kernels defines
+// MACROGRAD_NO_MAIN first, like mnist/train_mlp.cu
+#ifndef MACROGRAD_NO_MAIN
 int main() {
     Buffers d;
     float **all[] = {&d.x, &d.W, &d.b, &d.dy, &d.y, &d.dx, &d.dW, &d.db};
@@ -468,3 +476,4 @@ int main() {
     printf("\n%s\n", ok ? "all ok" : "SOMETHING IS WRONG");
     return ok ? 0 : 1;
 }
+#endif

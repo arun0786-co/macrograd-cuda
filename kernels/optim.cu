@@ -295,6 +295,9 @@ bool check_macrograd(const char *path, Device d) {
     return ok;
 }
 
+// the test. a program that includes this file for its kernels defines
+// MACROGRAD_NO_MAIN first, like mnist/train_mlp.cu
+#ifndef MACROGRAD_NO_MAIN
 int main() {
     Device d;
     float **all[] = {&d.w, &d.grad, &d.a, &d.b};
@@ -344,3 +347,4 @@ int main() {
     printf("\n%s\n", ok ? "all ok" : "SOMETHING IS WRONG");
     return ok ? 0 : 1;
 }
+#endif
