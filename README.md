@@ -134,6 +134,29 @@ The test also checks the backward formula against finite differences, and 30 sma
 
 I put 7 deliberate bugs into copies of the file and 6 fail the test. The one that passes removes the column check when loading the tile, which only fills tile slots that go to rows of `out` past the end, which are never written.
 
+### Layer norm
+
+`kernels/layer_norm.cu` is macrograd's `layer_norm` with `gamma` and `beta`: `y = gamma * (x - mean) / sqrt(var + eps) + beta` over each row, and its backward, `dx += rstd * (g - mean(g) - x_hat * mean(g * x_hat))` with `g = dy * gamma`, plus `dgamma` and `dbeta` summed over the rows. Rows go to a warp up to 1024 columns and to a block of 256 above that. The forward saves each row's mean and `1 / std` for the backward. `dgamma` and `dbeta` are column sums: each block takes 32 columns and one part of the rows, and a second kernel adds the parts in a fixed order, so a tall matrix still has enough blocks.
+
+The first version worked out the mean as a float, and for a row near 1000 a float mean is off by up to 3e-5, which every `x - mean` in the row inherited. Now each row has its first value `x_0` subtracted first, which is exact for nearby floats, and the kernels only hold `mean(x - x_0)`. The largest error on `y` went from 2.6e-5 to 4.5e-7.
+
+- Against macrograd on the same numbers, with one constant row (variance 0, so `1 / std` is 316): within 2.3e-5 on values up to 323, which is 7e-8 of their size.
+- 46 shapes against a CPU version in double, from 1 x 1 to 20000 x 16 and 1000 x 3000, with rows shifted by 1000 and constant rows, gradients that start at random values, and nothing written past the end of `y`. Largest errors relative to the size of what went in: 4.5e-7 for `y`, 1.4e-7 for `dx`, 2.2e-7 for `dgamma` and 1.4e-7 for `dbeta`.
+
+| Rows x cols | Forward | `dx` | `dgamma`, `dbeta` |
+|---|---|---|---|
+| 65536 x 256 | 0.962 ms, 139.5 GB/s | 1.681 ms, 159.7 GB/s | 0.440 ms, 304.7 GB/s |
+| 16384 x 1024 | 0.762 ms, 176.1 | 1.172 ms, 229.0 | 0.411 ms, 326.6 |
+| 4096 x 4096 | 0.648 ms, 207.2 | 1.148 ms, 233.7 | 0.416 ms, 322.6 |
+| 1024 x 16384 | 0.773 ms, 173.6 | 1.145 ms, 234.5 | 0.456 ms, 294.1 |
+
+GB/s counts each value once: 8 bytes for the forward (read `x`, write `y`), 16 for `dx` (read `x`, `dy`, `dx`, write `dx`) and 8 for the parameter gradients (read `x` and `dy`). `cudaMemcpy` does 356 GB/s.
+
+- The forward reads each row three times (sum, variance, write) and `dx` twice, so neither gets near copy speed. Keeping the row in registers (a warp's 32 lanes hold 1024 floats in 32 registers each) would read it once.
+- The parameter gradients read everything once and run at 83 to 92% of copy speed.
+
+I put 15 deliberate bugs into copies of the file and 14 fail the test. The one that passes uses a warp per row for every width, which is still right, just slower. One more passed at first: without the check for rows past the end, the forward wrote past the end of `y`, which the test didn't look at. It does now.
+
 ### Matmul: naive
 
 `C = A @ B` for square matrices, one thread per value of `C`, blocks of 32 x 32 threads. GFLOPS counts a multiply and an add for each of the `n^3` terms. Inputs are uniform in [-1, 1]. The error is `|gpu - ref| / sum_k |A[i][k] B[k][j]|` against a CPU matmul in double precision, over every value up to 1024 x 1024 and over 4100 sampled values above that. The last column is the time of `cublasSgemm` divided by the kernel's time.
