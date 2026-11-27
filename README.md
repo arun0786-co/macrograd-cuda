@@ -278,6 +278,42 @@ The full run trains 10 epochs from macrograd's init (uniform in `+-1 / sqrt(inpu
 - The blocked version is 6 times slower, and it's the matmuls. A batch of 64 gives the first layer's forward a single 128 x 128 block, which walks all 784 inputs alone, and its weight gradient 7 blocks, so most of the 28 SMs sit idle (see the linear layer above). cuBLAS picks kernels for shapes like these.
 - macrograd takes about 0.7 seconds for one step of 32 images, so an epoch there is about 20 minutes. The GPU does a step of 64 in 68 µs with cuBLAS.
 
+### Matmul: small shapes, split K
+
+The 2d kernel's 128 x 128 blocks are too big for small batches. For a batch of 64 with 128 outputs the first MNIST layer is one block, so one of the 28 SMs does the whole forward. `kernels/linear.cu` now picks a layout by shape. It uses 64 x 64 blocks (4 x 4 values per thread) unless the matmul is big. If those still give fewer than 2 blocks per SM, it also splits `K` into parts: separate blocks work out each part's sum into a scratch buffer, and a second kernel adds the parts in a fixed order and then the bias or what `C` held. `bench/matmul_plan_sweep.cu` timed the choices (ms, `M x N x K`, `C = A @ B`):
+
+| M x N x K | 128 x 128 | 64 x 64 | 64 x 64, 2 parts | 4 parts | 8 parts | 16 parts |
+|---|---|---|---|---|---|---|
+| 64 x 128 x 784 | 0.321 | 0.147 | 0.078 | 0.043 | 0.026 | 0.018 |
+| 784 x 128 x 64 | 0.047 | 0.017 | 0.018 | 0.025 | 0.038 | 0.038 |
+| 64 x 784 x 128 | 0.064 | 0.028 | 0.019 | 0.017 | 0.025 | 0.037 |
+| 1024 x 128 x 784 | 0.468 | 0.200 | 0.123 | 0.130 | 0.130 | 0.156 |
+| 1024 x 784 x 128 | 0.150 | 0.098 | 0.132 | 0.166 | 0.258 | 0.462 |
+| 512 x 512 x 512 | 0.259 | 0.118 | 0.129 | 0.135 | 0.154 | 0.200 |
+| 1024 x 1024 x 1024 | 1.175 | 0.867 | 0.828 | 0.788 | 0.827 | 1.018 |
+| 2048 x 2048 x 2048 | 5.214 | 5.538 | 5.588 | 5.805 | 6.319 | 6.108 |
+| 1024 x 4096 x 1024 | 2.663 | 2.915 | 3.072 | 3.360 | 3.593 | 3.926 |
+| 4096 x 4096 x 4096 | 38.28 | 43.08 | 43.29 | 44.51 | 47.09 | 52.39 |
+| 256 x 256 x 4096 | 1.855 | 0.810 | 0.417 | 0.227 | 0.240 | 0.253 |
+| 128 x 128 x 8192 | 3.691 | 1.641 | 0.834 | 0.430 | 0.242 | 0.137 |
+
+- The 128 x 128 blocks only win from 256 of them up. Two of them fit on an SM, and at 1024 x 1024 x 1024 the 64 blocks fill the GPU once and then leave most of it idle for a second round. So they're used from 8 blocks per SM (224) up.
+- Splitting `K` pays off when the 64 x 64 blocks are fewer than 2 per SM: 128 x 128 x 8192 goes from 1.64 ms to 0.14 ms with 16 parts. Splitting a matmul that already has enough blocks makes it slower, since every part writes a whole `M x N` partial sum. The rule picks enough parts to make 2 blocks per SM, each part at least 32 long.
+
+The layer now runs at these speeds (ms; the fixed column is the 128 x 128 kernel from before):
+
+| Rows x in -> out | Fixed forward | Forward | Fixed backward | Backward | cuBLAS forward | cuBLAS backward |
+|---|---|---|---|---|---|---|
+| 64 x 784 -> 128 | 0.332 | 0.018 | 0.123 | 0.039 | 0.018 | 0.017 |
+| 64 x 128 -> 10 | 0.068 | 0.010 | 0.074 | 0.022 | 0.007 | 0.011 |
+| 1024 x 784 -> 128 | 0.480 | 0.119 | 0.714 | 0.233 | 0.047 | 0.096 |
+| 1024 x 1024 -> 1024 | 1.280 | 0.881 | 2.432 | 1.931 | 0.250 | 0.484 |
+| 4096 x 4096 -> 4096 | 38.57 | 38.63 | 78.21 | 78.41 | 12.75 | 24.74 |
+
+The first MNIST layer's forward is 18 times faster and level with cuBLAS. Training MNIST with these kernels went from 402 ms per epoch to 85.5 ms (91 µs per step), against 64 ms with cuBLAS. The check against macrograd still passes (1.8e-7), and test accuracy after 10 epochs is 97.75%.
+
+The test now runs every shape three ways: the fixed kernel, the automatic choice, and a forced split into up to 4 parts with 64 x 64 blocks, so the split code is checked on every shape, not only the ones that pick it. I put 11 deliberate bugs into the new code and 5 fail the test. The other 6 don't change any result. Two load up to `K` instead of the end of the block's part, but parts are always whole tile steps long, so no tile crosses one. One doesn't round the parts to whole tile steps, and one doesn't recount the parts, which only makes uneven or empty parts, and an empty part adds 0. One runs the bias step on split launches, which get no bias. One changes the load loop's stride so some floats are loaded twice, with the same values.
+
 ## References
 
 - [How to Optimize a CUDA Matmul Kernel for cuBLAS-like Performance](https://siboehm.com/articles/22/CUDA-MMM), Simon Boehm

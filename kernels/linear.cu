@@ -17,6 +17,12 @@
 //    (backward)
 // db is a column sum, done by its own kernel.
 //
+// the 2d kernel's 128 x 128 blocks are too big for a small batch: a batch of 64 with 128
+// outputs is one block, so one SM does the whole forward. matmul() picks a layout by shape
+// (see Plan): 64 x 64 blocks unless the matmul is big, and if those are still too few, K
+// split into parts that separate blocks work out, then a second kernel adds the parts in a
+// fixed order.
+//
 // checked against a CPU version in double and against macrograd's linear on the same
 // numbers (tests/linear_macrograd.txt, from tests/make_linear_fixture.py), and timed
 // against the same passes done with cublasSgemm.
@@ -43,50 +49,65 @@
 
 // ---- the matmul: C (M, N) = A (M, K) @ B (K, N) ----
 
-const int BM = 128, BN = 128, BK = 8, TM = 8, TN = 8;
-const int THREADS = (BM / TM) * (BN / TN);
+// the tile sizes: a block makes a BM x BN piece of C, each thread a TM x TN square of it,
+// walking along K BK at a time. Big is the kernel from matmul_blocked.cu. Small has a
+// quarter of the area, for shapes where Big would leave SMs with nothing to do
+template <int BM_, int BN_, int TM_, int TN_>
+struct Tile {
+    static constexpr int BM = BM_, BN = BN_, BK = 8, TM = TM_, TN = TN_;
+    static constexpr int THREADS = (BM / TM) * (BN / TN);
+};
+using Big = Tile<128, 128, 8, 8>;
+using Small = Tile<64, 64, 4, 4>;
+const int THREADS = 256;  // both tiles use 256 threads, and so do the small kernels below
 
 // A(r, c) is A[r * K + c], or A[c * M + r] when A is stored transposed, as a (K, M) matrix.
 // B(r, c) is B[r * N + c], or B[c * K + r] when B is stored as (N, K).
 // the tile index idx is split so that neighbouring threads load neighbouring floats of
-// the stored matrix, down a row of it either way
-template <bool TA, bool TB>
-__device__ void load_tiles(const float *A, const float *B, float *As, float *Bs, int M, int N, int K,
+// the stored matrix, down a row of it either way. k_end is where this block's part of K
+// stops (K itself unless K is split), and everything from there on loads as 0
+template <typename T, bool TA, bool TB>
+__device__ void load_tiles(const float *A, const float *B, float *As, float *Bs, int M, int N, int K, int k_end,
                            int row0, int col0, int k0) {
-    for (int idx = threadIdx.x; idx < BM * BK; idx += THREADS) {
-        int r = TA ? idx % BM : idx / BK, c = TA ? idx / BM : idx % BK;
+    for (int idx = threadIdx.x; idx < T::BM * T::BK; idx += T::THREADS) {
+        int r = TA ? idx % T::BM : idx / T::BK, c = TA ? idx / T::BM : idx % T::BK;
         int gr = row0 + r, gc = k0 + c;
         float v = 0.0f;
-        if (gr < M && gc < K) {
+        if (gr < M && gc < k_end) {
             v = TA ? A[(size_t)gc * M + gr] : A[(size_t)gr * K + gc];
         }
-        As[r * BK + c] = v;
+        As[r * T::BK + c] = v;
     }
-    for (int idx = threadIdx.x; idx < BK * BN; idx += THREADS) {
-        int r = TB ? idx % BK : idx / BN, c = TB ? idx / BK : idx % BN;
+    for (int idx = threadIdx.x; idx < T::BK * T::BN; idx += T::THREADS) {
+        int r = TB ? idx % T::BK : idx / T::BN, c = TB ? idx / T::BK : idx % T::BN;
         int gr = k0 + r, gc = col0 + c;
         float v = 0.0f;
-        if (gr < K && gc < N) {
+        if (gr < k_end && gc < N) {
             v = TB ? B[(size_t)gc * K + gr] : B[(size_t)gr * N + gc];
         }
-        Bs[r * BN + c] = v;
+        Bs[r * T::BN + c] = v;
     }
 }
 
-// each thread makes a TM x TN square of C in registers, as in matmul_blocked.cu. then
+// each thread makes a TM x TN square of C in registers, as in matmul_blocked.cu, from the
+// part of K from blockIdx.z * k_chunk on. with one part (gridDim.z == 1):
 //   C = A @ B + bias          when bias is given (one value per column)
 //   C = C + A @ B             when accumulate is set
-template <bool TA, bool TB>
+// with several, block z writes its partial sum to the z-th M x N slice of C, which is
+// then a scratch buffer, and add_parts finishes the job
+template <typename T, bool TA, bool TB>
 __global__ void matmul_2d(const float *A, const float *B, float *C, const float *bias, bool accumulate,
-                          int M, int N, int K) {
+                          int M, int N, int K, int k_chunk) {
+    constexpr int BM = T::BM, BN = T::BN, BK = T::BK, TM = T::TM, TN = T::TN;
     __shared__ float As[BM * BK];
     __shared__ float Bs[BK * BN];
     int tcol = threadIdx.x % (BN / TN), trow = threadIdx.x / (BN / TN);
     int row0 = blockIdx.y * BM, col0 = blockIdx.x * BN;
+    int k_begin = blockIdx.z * k_chunk, k_end = min(K, k_begin + k_chunk);
     float acc[TM][TN] = {};
     float a[TM], b[TN];
-    for (int k0 = 0; k0 < K; k0 += BK) {
-        load_tiles<TA, TB>(A, B, As, Bs, M, N, K, row0, col0, k0);
+    for (int k0 = k_begin; k0 < k_end; k0 += BK) {
+        load_tiles<T, TA, TB>(A, B, As, Bs, M, N, K, k_end, row0, col0, k0);
         __syncthreads();
         for (int k = 0; k < BK; k++) {
             for (int i = 0; i < TM; i++) {
@@ -103,27 +124,120 @@ __global__ void matmul_2d(const float *A, const float *B, float *C, const float 
         }
         __syncthreads();
     }
+    float *out = C + (gridDim.z > 1 ? (size_t)blockIdx.z * M * N : 0);
     for (int i = 0; i < TM; i++) {
         for (int j = 0; j < TN; j++) {
             int r = row0 + trow * TM + i, c = col0 + tcol * TN + j;
             if (r < M && c < N) {
                 float v = acc[i][j];
-                if (bias) {
-                    v += bias[c];
+                if (gridDim.z == 1) {
+                    if (bias) {
+                        v += bias[c];
+                    }
+                    if (accumulate) {
+                        v += C[(size_t)r * N + c];
+                    }
                 }
-                if (accumulate) {
-                    v += C[(size_t)r * N + c];
-                }
-                C[(size_t)r * N + c] = v;
+                out[(size_t)r * N + c] = v;
             }
         }
     }
 }
 
+// adds the parts in order z = 0, 1, 2, ..., so the result is the same on every run, then
+// the bias or what C held
+__global__ void add_parts(const float *parts, int count, float *C, const float *bias, bool accumulate, int M, int N) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t MN = (size_t)M * N;
+    if (i < MN) {
+        float v = 0.0f;
+        for (int z = 0; z < count; z++) {
+            v += parts[z * MN + i];
+        }
+        if (bias) {
+            v += bias[i % N];
+        }
+        if (accumulate) {
+            v += C[i];
+        }
+        C[i] = v;
+    }
+}
+
+// scratch space for the parts, grown when a bigger matmul needs more. cudaMalloc waits for
+// the GPU, so after the first step of a training loop it isn't called again
+float *g_parts = nullptr;
+size_t g_parts_size = 0;
+
+float *parts_buffer(size_t n) {
+    if (n > g_parts_size) {
+        if (g_parts) {
+            CUDA_CHECK(cudaFree(g_parts));
+        }
+        CUDA_CHECK(cudaMalloc(&g_parts, n * sizeof(float)));
+        g_parts_size = n;
+    }
+    return g_parts;
+}
+
+int sm_count() {
+    static int sms = 0;
+    if (sms == 0) {
+        CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0));
+    }
+    return sms;
+}
+
+template <typename T, bool TA, bool TB>
+void run(const float *A, const float *B, float *C, const float *bias, bool accumulate, int M, int N, int K, int splits) {
+    // parts of K a whole number of BK steps long, and no empty ones
+    int k_chunk = ((K + splits - 1) / splits + T::BK - 1) / T::BK * T::BK;
+    splits = (K + k_chunk - 1) / k_chunk;
+    dim3 grid((N + T::BN - 1) / T::BN, (M + T::BM - 1) / T::BM, splits);
+    if (splits == 1) {
+        matmul_2d<T, TA, TB><<<grid, T::THREADS>>>(A, B, C, bias, accumulate, M, N, K, k_chunk);
+    } else {
+        float *parts = parts_buffer((size_t)splits * M * N);
+        matmul_2d<T, TA, TB><<<grid, T::THREADS>>>(A, B, parts, nullptr, false, M, N, K, k_chunk);
+        size_t MN = (size_t)M * N;
+        add_parts<<<(unsigned)((MN + THREADS - 1) / THREADS), THREADS>>>(parts, splits, C, bias, accumulate, M, N);
+    }
+}
+
+// how a matmul is laid out on the GPU:
+//   FIXED: Big tiles always, the kernel from before this change
+//   AUTO: Big tiles only for big matmuls, at least 8 blocks per SM: 2 fit on an SM at once,
+//         and with fewer rounds the last one leaves SMs idle (at 1024 x 1024 x 1024, 64 Big
+//         blocks take 1.17 ms and 256 Small ones 0.87). otherwise Small tiles, and if those
+//         give fewer than 2 blocks per SM, K is split into enough parts to make that many,
+//         each part at least 32 long. the readme has the sweep these numbers came from
+//   SPLIT: Small tiles and K in up to 4 parts, whatever the shape, so the test can check
+//         the split path on every shape
+enum Plan { FIXED, AUTO, SPLIT };
+
 template <bool TA, bool TB>
-void matmul(const float *A, const float *B, float *C, const float *bias, bool accumulate, int M, int N, int K) {
-    dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
-    matmul_2d<TA, TB><<<grid, THREADS>>>(A, B, C, bias, accumulate, M, N, K);
+void matmul(const float *A, const float *B, float *C, const float *bias, bool accumulate, int M, int N, int K,
+            Plan plan = AUTO) {
+    if (plan == FIXED) {
+        run<Big, TA, TB>(A, B, C, bias, accumulate, M, N, K, 1);
+        return;
+    }
+    if (plan == SPLIT) {
+        run<Small, TA, TB>(A, B, C, bias, accumulate, M, N, K, std::min(4, (K + 7) / 8));
+        return;
+    }
+    long sms = sm_count();
+    long big = (long)((M + 127) / 128) * ((N + 127) / 128);
+    if (big >= 8 * sms) {
+        run<Big, TA, TB>(A, B, C, bias, accumulate, M, N, K, 1);
+        return;
+    }
+    long small = (long)((M + 63) / 64) * ((N + 63) / 64);
+    int splits = 1;
+    if (small < 2 * sms) {
+        splits = (int)std::min<long>((2 * sms + small - 1) / small, std::max(1, K / 32));
+    }
+    run<Small, TA, TB>(A, B, C, bias, accumulate, M, N, K, splits);
 }
 
 // ---- db: column sums ----
@@ -159,21 +273,33 @@ void launch_column_sum(const float *dy, float *db, int R, int O) {
 // ---- the layer ----
 
 // y = x @ W + b
-void linear_forward(const float *x, const float *W, const float *b, float *y, int R, int I, int O) {
-    matmul<false, false>(x, W, y, b, false, R, O, I);
+template <Plan P>
+void forward_with(const float *x, const float *W, const float *b, float *y, int R, int I, int O) {
+    matmul<false, false>(x, W, y, b, false, R, O, I, P);
 }
 
 // dx += dy @ W^T, dW += x^T @ dy, db += column sums of dy. dx can be null when the
 // input needs no gradient, like the images going into a first layer
-void linear_backward(const float *x, const float *W, const float *dy, float *dx, float *dW, float *db,
-                     int R, int I, int O) {
+template <Plan P>
+void backward_with(const float *x, const float *W, const float *dy, float *dx, float *dW, float *db, int R, int I,
+                   int O) {
     // dy is (R, O) and W^T is W (I, O) read as (O, I)
     if (dx) {
-        matmul<false, true>(dy, W, dx, nullptr, true, R, I, O);
+        matmul<false, true>(dy, W, dx, nullptr, true, R, I, O, P);
     }
     // x^T is x (R, I) read as (I, R), and dy is (R, O)
-    matmul<true, false>(x, dy, dW, nullptr, true, I, O, R);
+    matmul<true, false>(x, dy, dW, nullptr, true, I, O, R, P);
     launch_column_sum(dy, db, R, O);
+}
+
+// what other files use: the matmuls pick their layout by shape
+void linear_forward(const float *x, const float *W, const float *b, float *y, int R, int I, int O) {
+    forward_with<AUTO>(x, W, b, y, R, I, O);
+}
+
+void linear_backward(const float *x, const float *W, const float *dy, float *dx, float *dW, float *db, int R, int I,
+                     int O) {
+    backward_with<AUTO>(x, W, dy, dx, dW, db, R, I, O);
 }
 
 // the same with cublasSgemm. cuBLAS stores matrices column by column, so a row-major
@@ -209,10 +335,10 @@ void cublas_backward(const float *x, const float *W, const float *dy, float *dx,
 
 typedef void (*Forward)(const float *, const float *, const float *, float *, int, int, int);
 typedef void (*Backward)(const float *, const float *, const float *, float *, float *, float *, int, int, int);
-const int VERSIONS = 2;
-const char *NAMES[] = {"blocked", "cublas"};
-const Forward FORWARDS[] = {linear_forward, cublas_forward};
-const Backward BACKWARDS[] = {linear_backward, cublas_backward};
+const int VERSIONS = 4;
+const char *NAMES[] = {"fixed", "auto", "split", "cublas"};
+const Forward FORWARDS[] = {forward_with<FIXED>, linear_forward, forward_with<SPLIT>, cublas_forward};
+const Backward BACKWARDS[] = {backward_with<FIXED>, linear_backward, backward_with<SPLIT>, cublas_backward};
 
 template <typename F>
 float time_ms(F launch) {
@@ -443,8 +569,10 @@ int main() {
 
     // one row, one input or one output, shapes that don't fill a 128 block or an 8 step
     // of the inner dimension, and the mnist shapes. every value is checked
+    // the last three split K in auto mode too
     int shapes[][3] = {{1, 1, 1}, {1, 5, 3}, {7, 1, 9}, {9, 7, 1}, {3, 100, 2}, {64, 784, 128},
-                       {64, 128, 10}, {129, 127, 9}, {200, 33, 257}, {8, 8, 8}, {130, 17, 300}};
+                       {64, 128, 10}, {129, 127, 9}, {200, 33, 257}, {8, 8, 8}, {130, 17, 300},
+                       {16, 5000, 16}, {1, 3001, 1}, {65, 999, 63}};
     bool shapes_ok = true;
     for (auto &s : shapes) {
         shapes_ok = check_shape(s[0], s[1], s[2], d, rng) && shapes_ok;
@@ -455,7 +583,7 @@ int main() {
     // timing. each pass is matmuls of 2 R I O flops: one forward, two backward
     printf("\n%-20s %-8s %-11s %-9s %-11s %-9s\n", "rows x in -> out", "version", "forward ms", "GFLOPS",
            "backward ms", "GFLOPS");
-    int timed[][3] = {{64, 784, 128}, {1024, 784, 128}, {1024, 1024, 1024}, {4096, 4096, 4096}};
+    int timed[][3] = {{64, 784, 128}, {64, 128, 10}, {1024, 784, 128}, {1024, 1024, 1024}, {4096, 4096, 4096}};
     for (auto &s : timed) {
         int R = s[0], I = s[1], O = s[2];
         double flops = 2.0 * R * I * O;
